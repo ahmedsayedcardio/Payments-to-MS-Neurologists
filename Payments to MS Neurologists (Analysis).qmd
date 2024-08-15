@@ -1,0 +1,3176 @@
+---
+title: "Industry Payments to Neurologists Prescribing Multiple Sclerosis Drugs"
+subtitle: "A Combined Analysis of the Open Payments and Medicare Part D Prescribers Databases"
+format: 
+  html:
+    toc: true
+    toc-expand: true
+    toc-location: body
+date: 2-5-2024
+theme: lightly
+author:
+  - name: "Ahmed Sayed (asu.ahmed.sayed@gmail.com) & Joseph S. Ross (joseph.ross@yale.edu)"
+    affiliations: "Ain Shams University, Faculty of Medicine & Yale School of Medicine"
+embed-resources: true
+toc-title: Contents
+page-layout: full
+code-fold: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Code Blocks
+
+## Packages & Functions
+
+### Load the necessary packages
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+#Load necessary packages
+packs <- c("ggplot2", "doParallel", "dplyr", "tidyr", "data.table", "janitor", "officer", "flextable", "pagedown", "extraDistr", "ggdist", "mgcv", "marginaleffects", "emmeans",
+           "stringr", "stringi", "forcats", "ggsci", "ggpubr", "ggthemes", "splines", "glmmTMB", "rms",
+            "grid", "gridExtra", "qs", "Hmisc", "kit", "scales", "ggdist")
+lapply(packs, require, character.only = TRUE)
+```
+
+### Define the necessary functions
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+#Round to 1 decimal
+r1 <- function(x) {
+  x %>% round(1) %>% format(nsmall = 1)
+}
+
+#Round to 2 decimals
+r2 <- function(x) {
+  x %>% round(2) %>% format(nsmall = 2)
+}
+
+
+#Function to format P-values
+p <- function(p) {
+  ifelse(p < 0.001, "<0.001", ifelse(round(p, 2) == 0.05 | round(p, 2) == 0, round(p, 3) %>% format(nsmall = 3), round(p, 2) %>% format(nsmall = 2))) %>% as.character
+}
+
+
+#Aggregate a group by amount of payments
+aggregate_amount <- function(grouping_variable) {
+  x[, .(amount = sum(amount)), 
+    by = grouping_variable] %>%
+    mutate(prop = (100*amount/sum(amount)) %>% r1,
+           amount = amount %>% round(0)) %>%
+    arrange(-as.numeric(prop)) %>%
+    bind_rows(data.table(amount = sum(.$amount),
+                            prop = "100"
+    )[,(grouping_variable) := "Total"],
+    .) %>%
+    mutate(amount = paste0(amount, " (" , prop, "%)") %>% str_replace("\\( ", "(")) %>%
+    select(-prop) %>%
+    mutate(year = file_year)
+}
+
+#Aggregate a group by N of payments
+aggregate_payments_n <- function(grouping_variable) {
+  x[, .(payments_n = sum(payments_n)), 
+    by = grouping_variable] %>%
+    mutate(prop = (100*payments_n/sum(payments_n)) %>% r1,
+           payments_n = payments_n %>% round(0)) %>%
+    arrange(-as.numeric(prop)) %>%
+    bind_rows(data.table(payments_n = sum(.$payments_n),
+                         prop = "100"
+    )[,(grouping_variable) := "Total"],
+    .) %>%
+    mutate(payments_n = paste0(payments_n, " (" , prop, "%)") %>% str_replace("\\( ", "(")) %>%
+    select(-prop) %>%
+    mutate(year = file_year)
+}
+
+#Tidy up strings (sort & unique)
+sunique <- function(x, sep = ";") {
+  x %>% str_split(sep) %>% lapply(., unique) %>% lapply(., sort) %>% sapply(., paste, collapse = ";")
+}
+
+#Create a function to return 0 or 1 depending on the value of a sum (to be used in the analysis)
+zero_one <- function(x) {
+  if(sum(x > 0)) {
+    1
+  } else if(sum(x) == 0) {
+    0
+  }
+}
+
+#Function to add commas
+comma <- function(x) {
+  if(!is.numeric(x)) {
+    x <- x %>% pull
+  }
+  x %>%
+    format(big.mark = ",", trim = T)
+}
+
+#Perform some aesthetic modifications for flextables
+flextable_aes <- function(table, table_title) {
+  
+  #Table font
+  table <- flextable::font(table, fontname = "Times New Roman", part = "all")
+  
+  #Align everything centrally
+  table <- flextable::align(table, align = "center", part = "all")
+  
+  #Table heading
+  table <- flextable::set_caption(table, caption = table_title,
+                                  fp_p = fp_par(text.align = "left"))
+  
+  #Align footer to the left
+  table <- flextable::align(table, align = "left", part = "footer")
+  
+  #Bold header
+  table <- flextable::bold(table, part = "header")
+  
+  #Set Table width
+  table <- flextable::width(table, width = 1.5, unit = "in")
+  
+  #Bold
+  table <- flextable::bold(table, part = "header")
+  
+  #Print
+  table
+}
+
+#Function to insert footnote symbol in the correct order
+footnote_symbol <- function(i) {
+  footnote_symbols <- c("\U002A", "\U2020", "\U2021", "\U00A7")
+  footnote_symbols[i]
+}
+```
+
+## Create subfolders
+
+```{r}
+#Create a figures directory if it does not exist
+if(!dir.exists("Figures")) {
+  dir.create("Figures")
+}
+if(!dir.exists("Tables")) {
+  dir.create("Tables")
+}
+```
+
+## Importing Data
+
+### Import sheet defining each drug and its route of administration
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+#Construct search strings for different MS drugs
+#All
+ms_drugs <- ms_drugs <- readxl::read_xlsx("MS_Drugs.xlsx") %>%
+  pull(Drug) %>%
+  str_remove("\\)") %>%
+  str_split(" \\(", simplify = TRUE) %>% 
+  as.vector %>%
+  paste0("(?i)", .) %>%
+  paste0(collapse = "|")
+
+#Oral
+oral_ms_drugs <- readxl::read_xlsx("MS_Drugs.xlsx") %>%
+  filter(Type == "Oral") %>%
+  pull(Drug) %>%
+  str_remove("\\)") %>%
+  str_split(" \\(", simplify = TRUE) %>% 
+  as.vector %>%
+  paste0("(?i)", .) %>%
+  paste0(collapse = "|")
+
+#Injectables
+inj_ms_drugs <- readxl::read_xlsx("MS_Drugs.xlsx") %>%
+  filter(Type == "Injectable") %>%
+  pull(Drug) %>%
+  str_remove("\\)") %>%
+  str_split(" \\(", simplify = TRUE) %>% 
+  as.vector %>%
+  paste0("(?i)", .) %>%
+  paste0(collapse = "|")
+
+#Infusion
+inf_ms_drugs <- readxl::read_xlsx("MS_Drugs.xlsx") %>%
+  filter(Type == "Infusion") %>%
+  pull(Drug) %>%
+  str_remove("\\)") %>%
+  str_split(" \\(", simplify = TRUE) %>% 
+  as.vector %>%
+  paste0("(?i)", .) %>%
+  paste0(collapse = "|")
+
+#Construct case-insensitive search strings for specific drugs
+avonex <- "(?i)Avonex"
+betaseron <- "(?i)Betaseron"
+copaxone <- "(?i)Copaxone"
+extavia <- "(?i)Extavia"
+glatiramer_acetate <- "(?i)Glatiramer Acetate"
+glatopa <- "(?i)Glatopa"
+kesimpta <- "(?i)Kesimpta"
+plegridy <- "(?i)Plegridy"
+rebif <- "(?i)Rebif"
+aubagio <- "(?i)Aubagio"
+bafiertam <- "(?i)Bafiertam"
+dimethyl_fumurate <- "(?i)Dimethyl Fumarate"
+gilenya <- "(?i)Gilenya"
+mavenclad <- "(?i)Mavenclad"
+mayzent <- "(?i)Mayzent"
+tecfidera <- "(?i)Tecfidera"
+vumerity <- "(?i)Vumerity"
+zeposia <- "(?i)Zeposia"
+tecfidera <- "(?i)Tecfidera"
+lemtrada <- "(?i)Lemtrada"
+ocrevus <- "(?i)Ocrevus"
+tysabri <- "(?i)Tysabri"
+specific_drugs <- c(avonex, betaseron, copaxone, extavia,
+                    glatiramer_acetate, glatopa, kesimpta, plegridy, rebif,
+                    aubagio, bafiertam, dimethyl_fumurate, gilenya,
+                     mavenclad, mayzent, tecfidera, vumerity, zeposia,
+                    lemtrada, ocrevus, tysabri)
+
+#Get drug labels
+ms_drug_labels <- readxl::read_xlsx("MS_Drugs.xlsx") %>%
+  pull(Drug)
+
+#Construct a dataframe for each drug's search string and its drug label
+drug_names_df <- data.table(
+  specific_drug = c(specific_drugs,
+                    ms_drugs, oral_ms_drugs, inj_ms_drugs, inf_ms_drugs),
+  specific_drug_label = c(ms_drug_labels,
+  "All",  "All oral drugs", "All injectable drugs", "All infusable drugs"),
+  category =  c(readxl::read_xlsx("MS_Drugs.xlsx") %>% pull(Type),
+  "All", "Oral", "Injectable", "Infusion")
+)
+
+
+```
+
+### Import the Open Payments Datasets
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+#Set data table to use as many threacs as possible - 2 
+setDTthreads(detectCores() - 2)
+
+#Only import the data if you have not previously saved it (to save on time, since this is a large database)
+if(!file.exists("Open Payments Data.RData")) {
+  
+#Designate wanted columns
+wanted_cols_op <- .q(
+                 #2016-2019
+                 Covered_Recipient_NPI, 
+                 Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_1,
+                 Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_2,
+                 Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_3,
+                 Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_4,
+                 Name_of_Drug_or_Biological_or_Device_or_Medical_Supply_5,
+                 Covered_Recipient_Specialty_1, 
+                 #2014-2015
+                 Physician_Profile_ID, 
+                 Physician_NPI, 
+                 Name_of_Associated_Covered_Drug_or_Biological1,
+                 Name_of_Associated_Covered_Drug_or_Biological2,
+                 Name_of_Associated_Covered_Drug_or_Biological3,
+                 Name_of_Associated_Covered_Drug_or_Biological4,
+                 Name_of_Associated_Covered_Drug_or_Biological5,
+                 #In common from 2014-2019
+                 Total_Amount_of_Payment_USDollars, Number_of_Payments_Included_in_Total_Amount,
+                 Nature_of_Payment_or_Transfer_of_Value, 
+                 Form_of_Payment_or_Transfer_of_Value,
+                 Physician_Specialty, Program_Year,
+                 Applicable_Manufacturer_or_Applicable_GPO_Making_Payment_Name)
+
+#Set file year for experimental attempts at running the contents of the loop manually
+file_year <- 2018
+
+#Run foreach loop and store in opd ("Open payments data")
+opd <- foreach(file_year = seq(2014, 2019, 1),
+             .packages = packs,
+             .combine = "rbind") %do% {
+               
+               #Get directory 
+               file <- paste0("C:/Ahmed's Stuff/ResearchStuff/Open Payments Data/General_Payments_", file_year, ".csv")
+               
+               #Read file
+               x <- fread(file,
+                          select = wanted_cols_op,
+                          nThread = 14)
+               
+               #If file_year is 2014, add NPI from the separate file since only data from 2015 and onwarcs have NPI embedded in the file
+               if(file_year == 2014) {
+                 wanted_cols_po <- .q(Covered_Recipient_Profile_ID, Covered_Recipient_NPI, Covered_Recipient_Profile_Primary_Specialty)
+                 provider_info <- fread("C:/Ahmed's Stuff/ResearchStuff/Open Payments Data/Provider_Info.csv",
+                                        nThread = 14,
+                                        select = wanted_cols_po)
+                 provider_info <- provider_info[grepl(pattern = "^Allopathic & Osteopathic Physicians\\|Psychiatry & Neurology\\|Neurology$",
+                                                      x = Covered_Recipient_Profile_Primary_Specialty)]
+                 
+                 x <- merge(x, provider_info, 
+                            all.x = TRUE, all.y = FALSE,
+                            by.x = "Physician_Profile_ID", by.y = "Covered_Recipient_Profile_ID")
+                 
+               }
+               
+               
+               #Make column names easier to reference
+               x <- clean_names(x)
+               
+               #Rename
+               x <- x %>%
+                 rename(any_of(c(
+                   #For 2016+ data
+                   item_name_1 = "name_of_drug_or_biological_or_device_or_medical_supply_1",
+                   item_name_2 = "name_of_drug_or_biological_or_device_or_medical_supply_2",
+                   item_name_3 = "name_of_drug_or_biological_or_device_or_medical_supply_3",
+                   item_name_4 = "name_of_drug_or_biological_or_device_or_medical_supply_4",
+                   item_name_5 = "name_of_drug_or_biological_or_device_or_medical_supply_5",
+                   #For 2014-2015 data
+                   item_name_1 = "name_of_associated_covered_drug_or_biological1",
+                   item_name_2 = "name_of_associated_covered_drug_or_biological2",
+                   item_name_3 = "name_of_associated_covered_drug_or_biological3",
+                   item_name_4 = "name_of_associated_covered_drug_or_biological4",
+                   item_name_5 = "name_of_associated_covered_drug_or_biological5",
+                   first_name = "covered_recipient_first_name",
+                   last_name = "covered_recipient_last_name",
+                   #Two differet NPIs for 2014-2015 and 2016+
+                   npi = "physician_npi",
+                   npi = "covered_recipient_npi",
+                   specialty = "physician_specialty",
+                   specialty = "covered_recipient_specialty_1",
+                   #Other columns that are similar for both
+                   amount = "total_amount_of_payment_us_dollars",
+                   payments_n = "number_of_payments_included_in_total_amount",
+                   payment_nature = "nature_of_payment_or_transfer_of_value",
+                   payment_form = "form_of_payment_or_transfer_of_value",
+                   year = "program_year",
+                   company = "applicable_manufacturer_or_applicable_gpo_making_payment_name",
+                   pdate = "date_of_payment"
+                 )))
+               
+               #Get number of general payments
+               gps_n <- x[, payments_n] %>% sum
+               
+               #Get number of hospitals and filter them out (any row with a missing specialty)
+               hosps_n <- x[specialty == "", payments_n] %>% sum
+               x <- x[specialty != ""]
+               
+               #The remaining N of rows is that of healthcare professionals
+               hps_n <- x[, payments_n] %>% sum 
+               
+               #Get number of non-physician HPs and filter them out
+               non_physician_hps_n <- x[!grepl(pattern = "^Allopathic & Osteopathic Physicians\\|",
+                                              x = specialty),
+                                        payments_n] %>% sum
+               x <- x[grepl(pattern = "^Allopathic & Osteopathic Physicians\\|",
+                                               x = specialty)]
+               
+               #The remaining N is that of physician HPs (Mcs/DOs)
+               physicians_n <- x[, payments_n] %>% sum
+               
+               #Get number of non-neurologists (neuropsychiatrists) and filter them out
+               non_neurologists_n <- x[!grepl(pattern = "^Allopathic & Osteopathic Physicians\\|Psychiatry & Neurology\\|Neurology$",
+                                              x = specialty),
+                                       payments_n] %>% sum
+               x <- x[grepl(pattern = "^Allopathic & Osteopathic Physicians\\|Psychiatry & Neurology\\|Neurology$",
+                                              x = specialty)]
+               
+               #The remaining N is that of neurologists
+               neurologists_n <- x[, payments_n] %>% sum
+               
+               #Get number of payments not related to MS drugs and filter them out
+               #First, get number of MS drugs per payment
+               x[,
+                      ms_drug_n := grepl(pattern = ms_drugs,
+                                         x = item_name_1) +
+                        grepl(pattern = ms_drugs,
+                              x = item_name_2) +
+                        grepl(pattern = ms_drugs,
+                              x = item_name_3) +
+                        grepl(pattern = ms_drugs,
+                              x = item_name_4) +
+                        grepl(pattern = ms_drugs,
+                              x = item_name_5)
+               ]
+               
+               #Get number of payments NOT related to ms_drugs and filter them out
+               non_ms_n <- x[ms_drug_n == 0, payments_n] %>% sum
+               x <- x[ms_drug_n > 0]
+               
+               
+               #What remains is the N of MS-related payments
+               ms_n <- x[, payments_n] %>% sum
+               
+               #1, 2, or 3+ mecs per payment
+               ms_n_1 <- x[ms_drug_n == 1, payments_n] %>% sum
+               ms_n_2 <- x[ms_drug_n == 2, payments_n] %>% sum
+               ms_n_3plus <- x[ms_drug_n >= 3, payments_n] %>% sum
+               
+               #Combine data needed for the flowchart
+               op_flowchart_df <- data.table(file_year, gps_n, non_physician_hps_n, hps_n,
+                                             physicians_n, non_neurologists_n, neurologists_n,
+                                             non_ms_n, ms_n, ms_n_1, ms_n_2, ms_n_3plus)
+               
+               
+               #Concatenate item names together to make it easier to look through them with grepl
+               x[, item_names := paste(item_name_1, item_name_2,
+                                       item_name_3, item_name_4,
+                                       item_name_5, sep = ",")]
+               
+               #Get N of payments per specific drug
+               drug_payments_n <- foreach(specific_drug = drug_names_df$specific_drug,
+                                          specific_drug_label = drug_names_df$specific_drug_label,
+                                          drug_category = drug_names_df$category,
+                                          .combine = "rbind") %do% {
+                 data.table(drug = specific_drug %>% str_remove("\\(\\?i\\)"), 
+                            drug_label = specific_drug_label,
+                            category = drug_category,
+                            payments_n = x[grepl(pattern = specific_drug, x = item_names), payments_n] %>% sum,
+                            year = file_year)
+                                          }
+               
+               
+               #Get amount of payments per specific drug
+               drug_payments_amount <- foreach(specific_drug = drug_names_df$specific_drug,
+                                          specific_drug_label = drug_names_df$specific_drug_label,
+                                          drug_category = drug_names_df$category,
+                                          .combine = "rbind") %do% {
+                                            data.table(drug = specific_drug %>% str_remove("\\(\\?i\\)"), 
+                                                       drug_label = specific_drug_label,
+                                                       category = drug_category,
+                                                       amount = x[grepl(pattern = specific_drug, x = item_names), amount] %>% sum,
+                                                       year = file_year)
+                                          }
+               
+               #Create a factor level containing the required companies and collectively label others as "Other"
+               x[, company := kit::nif(
+                 grepl(x = company, pattern = "(?i)Novartis|(?i)Sandoz"), "Novartis, Inc.",
+                 grepl(x = company, pattern = "(?i)Sanofi|(?i)Genzyme"), "Sanofi, Inc.",
+                 grepl(x = company, pattern = "(?i)Teva"), "Teva Pharmaceuticals, Inc.",
+                 grepl(x = company, pattern = "(?i)Biogen"), "Biogen, Inc.",
+                 grepl(x = company, pattern = "(?i)Merck|(?i)Serono"), "Merck, Inc.",
+                 grepl(x = company, pattern = "(?i)Bayer"), "Bayer Healthcare, Inc.",
+                 grepl(x = company, pattern = "(?i)Pfizer"), "Pfizer, Inc.",
+                 grepl(x = company, pattern = "(?i)Mylan"), "Mylan, Inc.",
+                 grepl(x = company, pattern = "(?i)Roche|(?i)Genentech"), "F. Hoffmann-La Roche, Inc.",
+                 grepl(x = company, pattern = "(?i)Celgene"), "Celgene Corporation",
+                 default = company
+               ) %>% factor]
+        
+               #Group companies by N &  amount of payments
+               companies_payments_n <- aggregate_payments_n("company")
+               companies_payments_amounts <- aggregate_amount("company")
+               
+               #Concatenate payment nature into relevant groups (use nif from the kit package to allow an easy default)
+               x[, payment_nature := kit::nif(
+                   grepl(x = payment_nature, pattern = "(?i)Compensation for serv"), "Non-consulting fees",
+                   grepl(x = payment_nature, pattern = "Gift|Entertainment|Charitable Contribution|Grant|Honoraria"), "Other",
+                   default = as.character(payment_nature) ) %>% factor]
+               
+               #Group payment nature by N & amount of payments
+               nature_payments_n <- aggregate_payments_n("payment_nature")
+               nature_payments_amount <- aggregate_amount("payment_nature")
+               
+               #Group payment nature by N & amount of payments
+               form_payments_n <- aggregate_payments_n("payment_form")
+               form_payments_amount <- aggregate_amount("payment_form")
+               
+               #Create a list containing all of the relevant data
+               list(op_flowchart_df, #Open payments flowchart
+                    drug_payments_n,  #N of payments per drug
+                    companies_payments_n, #N of payments per company
+                    companies_payments_amounts, #Amount of payments per company
+                    nature_payments_n, #N of payments per payment_nature
+                    nature_payments_amount, #Amount of payments per payment_nature
+                    form_payments_n, #N of payments per payment_form
+                    form_payments_amount, #Amount of payments per payment_form
+                    x[, .(npi, amount, payments_n, year, item_names, payment_nature, company)] #Save Data
+                    )
+               
+             }
+} else {
+  opd <- qread(file = "Open Payments Data.RData")
+}
+
+
+
+#Save output
+qsave(x = opd,
+      file = "Open Payments Data.RData")
+
+#Convert to data.table
+opd <- data.table(opd)
+#Rename columns
+names(opd) <- .q(op_flowchart_df, #Open payments flowchart
+                 drug_payments_n,  #N of payments per drug
+                 companies_payments_n, #N of payments per company
+                 companies_payments_amounts, #Amount of payments per company
+                 nature_payments_n, #N of payments per payment_nature
+                 nature_payments_amount, #Amount of payments per payment_nature
+                 form_payments_n, #N of payments per payment_form
+                 form_payments_amount, #Amount of payments per payment_form
+                 x)
+
+#Bind each together into a single dataframe
+op_flowchart_df <- opd$op_flowchart_df %>% rbindlist
+drug_payments_n <- opd$drug_payments_n %>% rbindlist
+companies_payments_n <- opd$companies_payments_n %>% rbindlist
+companies_payments_amounts <- opd$companies_payments_amounts %>% rbindlist
+nature_payments_n <- opd$nature_payments_n %>% rbindlist
+nature_payments_amount <- opd$nature_payments_amount %>% rbindlist
+form_payments_n <- opd$form_payments_n %>% rbindlist
+form_payments_amount <- opd$form_payments_amount %>% rbindlist
+x <- opd$x %>% rbindlist
+
+#Save a data.table with payment nature preserved
+x_pn <- x[, .(amount = sum(amount),
+           payments_n = sum(payments_n)), 
+       by = .(npi, year, company, payment_nature)]
+
+#Change format of payment natures data.table
+x_pn <- x_pn %>%
+  pivot_wider(id_cols = c("npi", "year", "company"),
+              names_from = payment_nature,
+              values_from = amount) %>%
+  data.table
+
+#Rename columns
+setnames(x_pn,
+         old = c("Food and Beverage", "Education",
+                 "Other", "Travel and Lodging",
+                 "Non-consulting fees", "Consulting Fee"),
+         new = c("food_bev", "educ",
+                 "other", "travel",
+                 "non_consult", "consult"))
+
+#Save the names of columns referring to payment types
+payment_types_names <- c("food_bev", "educ",
+                         "other", "travel",
+                         "non_consult", "consult")
+
+#Fill up these NAs with 0s
+setnafill(x_pn, fill = 0, cols = payment_types_names)
+
+#Coalesce X by NPI/Year/Company
+x <- x[, .(amount = sum(amount),
+           payments_n = sum(payments_n)), 
+       by = .(npi, year, company)]
+```
+
+### Import the Part D Prescribers Datasets
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+
+#Only import the data if you have not previously saved it (to save on time, since this is a large database)
+if(!file.exists("Prescription Data.RData")) {
+
+#Designate the wanted columns from the file
+wanted_cols_pr <- .q(Prscrbr_NPI, Brnd_Name, Tot_Clms, Prscrbr_Type, Prscrbr_City, Prscrbr_State_Abrvtn)
+
+#Run foreach loop and store it in prescriptions data ("prd")
+prd <- foreach(file_year = seq(2015, 2020, 1),
+               .packages = packs,
+               .combine = "rbind") %do% {
+                 
+  #Get directory
+  file <- paste0("C:/Ahmed's Stuff/ResearchStuff/Medicare Part D Prescriber Data/Medicare_Part_D_Prescribers_by_Provider_and_Drug_", file_year, ".csv")
+  
+  #Read file
+  y <- fread(file,
+             select = wanted_cols_pr,
+             nThread = 14)
+  
+  #Clean up column names
+  y <- clean_names(y)
+  
+  #Rename columns
+  y <- y %>% rename(any_of(.q(
+    npi = prscrbr_npi,
+    n_prescriptions = tot_clms,
+    prescribed_drug = brnd_name,
+    specialty = prscrbr_type,
+    city = prscrbr_city,
+    state = prscrbr_state_abrvtn,
+    
+  )))
+  
+  #Get total number of recorcs
+  total_prescriptions <- y[, n_prescriptions] %>% sum
+  
+  #Get number of non-neurologist events and filter them out
+  non_neurologists_prescriptions <- y[specialty != "Neurology", n_prescriptions] %>% sum
+  y <- y[specialty == "Neurology"]
+  
+  #What remains is the N of neurologist events
+  neurologist_prescriptions <- y[, n_prescriptions] %>% sum
+  
+  #Get total number of non-MS drugs prescriptions by neurologists and filter them out
+  non_ms_prescriptions <- y[!grepl(pattern = ms_drugs, x = prescribed_drug), n_prescriptions] %>% sum
+  y <- y[grepl(pattern = ms_drugs, x = prescribed_drug)]
+  
+  #What remains is the number of MS prescriptions
+  ms_prescriptions <- y[, n_prescriptions] %>% sum
+  
+  #Filter to prescribers who've used MS drugs
+  y <- y[grepl(pattern = ms_drugs,
+               x = prescribed_drug)]
+ 
+  #Create year of prescription
+  y[, year_of_prescription := file_year]
+  
+  #Save desired output
+  list(total_prescriptions, non_neurologists_prescriptions, neurologist_prescriptions,
+       non_ms_prescriptions, ms_prescriptions, y[, specialty := NULL])
+}} else {
+  prd <- qread(file = "Prescription Data.RData")
+}
+#Save output
+qsave(x = prd,
+      file = "Prescription Data.RData")
+
+#Convert to data.table
+prd <- data.table(prd)
+#Rename columns
+names(prd) <- .q(total_prescriptions, #N of total prescriptions
+                 non_neurologists_prescriptions, #N of non-neurologists prescriptions
+                 neurologist_prescriptions, #N of neurologist prescriptions
+                 non_ms_prescriptions, #N of non-MS prescriptions
+                 ms_prescriptions, #N of MS precsriptions
+                 y) #Prescription data (to merge with x)
+
+
+#Bind each together into a single dataframe
+total_prescriptions <- prd$total_prescriptions %>% unlist %>% sum
+non_neurologists_prescriptions <- prd$non_neurologists_prescriptions %>% unlist %>% sum
+neurologist_prescriptions <- prd$neurologist_prescriptions %>% unlist %>% sum
+non_ms_prescriptions <- prd$non_ms_prescriptions %>% unlist %>% sum
+ms_prescriptions <- prd$ms_prescriptions %>% unlist %>% sum
+y <- prd$y %>% rbindlist
+#Rename the year of prescription column in y
+y <- y %>% rename(year = year_of_prescription) 
+
+```
+
+## Figure 1, Table 1 & Table S2 (payments by company & year)
+
+### Create data.table to be used for Table 1
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+
+##################################################################################
+#Aggregate column for company totals (summing across all years)
+
+#Get the unique companies in x that made payments to prescribers from 2015 to 2019
+unique_companies <- x[year %between% c(2015, 2019) & npi %in% y[, npi], unique(company)]
+
+#Merge npi_cyears with x, irrespective of year (ct: company totals)
+ct <- merge.data.table(x = unique(y[year != 2020,
+                                    .(npi)]), 
+                       y = x[year != 2014,.(amount = sum(amount),
+                                            payments_n = sum(payments_n)),
+                               by = .(npi, company)],
+                       by = c("npi"),
+                       all.x = TRUE,
+                       all.y = FALSE)
+
+#Save for figure 1
+fig1_df <- copy(ct)
+
+#Check that the N of rows in do is less than the product of the N of companies and N of prescribers
+ct[,.N] < y[year != 2020, uniqueN(npi)] * length(unique_companies)
+
+#If amount/payments_n is NA (missing from OPD), insert a zero (no payments)
+ct[, amount := fifelse(amount == 0 | is.na(amount), 0, amount)]
+ct[, payments_n := fifelse(payments_n == 0 | is.na(payments_n), 0, payments_n)]
+
+#Add totals column
+ct[, year := "Total (2015-2019)"]
+
+#Get total amount paid to prescribers over 2015-2019
+total_amount_2015_2019 <- ct[, sum(amount) %>% round(0)]
+#Get total payments to prescribers over 2015-2019
+total_payments_2015_2019 <- ct[, sum(payments_n)]
+#Total N of paid prescribers
+paid_prescribers_2015_2019 <- ct[amount > 0, uniqueN(npi)]
+#Total prescribers
+total_prescribers_2015_2019 <- ct[, uniqueN(npi)]
+#Highest payments company
+highest_payments_company <- ct[, .(amount = sum(amount, na.rm = T)), by = company][amount == max(amount)][, company]
+highest_payments_company_amount <- ct[, .(amount = sum(amount, na.rm = T)), by = company][amount == max(amount)][, amount]
+#Highest reach company
+highest_reach_company <- ct[, .(n_paid = sum(amount > 0)), by = company][n_paid == max(n_paid)][, company]
+highest_reach_n <- ct[, .(n_paid = sum(amount > 0)), by = company][n_paid == max(n_paid)][, n_paid]
+
+
+#Proportion of paid prescribers
+paid_prop_2015_2019 <- (100*(ct[amount > 0, uniqueN(npi)]/ct[, uniqueN(npi)])) %>% r1
+#Quantiles
+qs_2015_2019 <- ct[, .(amount = sum(amount)), by = npi][, quantile(amount[amount > 0], c(0.25, 0.5, 0.75))]
+#Top percentile earners
+amount_top_earners_2015_2019 <- ct[, .(amount = sum(amount)), by = npi][amount >= quantile(amount[amount > 0], c(0.90)), sum(amount)]
+
+#Group by company
+ct <- ct[, .(amount_total = paste0(sum(payments_n) %>% comma, " | " , sum(amount) %>% round(0) %>% comma),
+             q50_total = quantile(amount[amount > 0])["50%"],
+             q25_total = quantile(amount[amount > 0])["25%"],
+             q75_total = quantile(amount[amount > 0])["75%"],
+             n_paid_total = sum(amount > 0)
+             ), 
+         by = .(company)]
+
+#Add a total row
+ct <- rbind(ct,
+      data.table(
+        company = "Total",
+        amount_total = paste0(total_payments_2015_2019 %>% comma, " | ", total_amount_2015_2019 %>% comma),
+        q50_total = qs_2015_2019["50%"],
+        q25_total = qs_2015_2019["25%"],
+        q75_total = qs_2015_2019["75%"],
+        n_paid_total = paid_prescribers_2015_2019
+      ))
+
+#Remove NA row for company (automatically created for those who received no payments)
+ct <- ct[!is.na(company)]
+
+#Replace NAs with 0
+ct <- ct %>%
+  mutate(across(.q(q25_total, q50_total, q75_total), ~ . %>% replace_na(0)))
+  
+#Calculate % of prescribers receiving a payment
+ct$paid_prop_total <- (100*ct$n_paid/total_prescribers_2015_2019) %>% r1
+#Add the N of payments to paid_prop
+ct$paid_prop_total <- paste0(ct$n_paid_total %>% comma, " (", ct$paid_prop_total, ")") %>% str_squish
+
+
+#Create a column containing median & IQR
+ct$median_iqr_total <- ifelse(ct$q25 > 0,
+  paste0(ct$q50 %>% round(0) %>% comma,
+  " (", ct$q25 %>% round(0) %>% comma, 
+  " - ",
+  ct$q75 %>% round(0) %>% comma, ")"),
+  "No payments"
+)
+
+ct[, c("q25_total", "q50_total", "q75_total") := NULL]
+
+###################################################################################
+#Aggregate columns for yearly totals (summing across companies)
+
+#Create an ID column for each NPI in each year
+y[, npi_year := paste0(npi, "_", year)]
+
+#Merge npi_cyears with x irrespective of company on the basis of year (cyt: data yearly totals)
+cyt <- merge.data.table(x = unique(y[year != 2020,
+                                     .(npi, year)]), 
+                       y = x[,.(amount = sum(amount),
+                                payments_n = sum(payments_n)),
+                               by = .(npi, year)],
+                       by = c("npi", "year"),
+                       all.x = TRUE,
+                       all.y = FALSE)
+
+#Check that the N of rows in cyt is equal to the N of unique combinations of NPI and year
+cyt[,.N] == y[year != 2020, uniqueN(npi_year)]
+
+#If amount is NA (missing from OPD), insert a zero (no payments)
+cyt[, amount := fifelse(amount == 0 | is.na(amount), 0, amount)]
+cyt[, payments_n := fifelse(payments_n == 0 | is.na(payments_n), 0, payments_n)]
+
+
+#Add drug column
+cyt[, company := "Total"]
+
+###################################################################################
+#Create a data.table containing data on each provider for each year by each company
+
+#Create a data.table with each provider having a separate row for each drug and each row
+npi_cyears <- data.table(npi = y[year != 2020,
+                                 unique(npi_year)] %>%
+                           rep(each = length(unique_companies)) %>%
+                           str_sub(1, 10) %>%
+                           as.integer,
+                         year = y[year != 2020,
+                                  unique(npi_year)] %>%
+                           rep(each = length(unique_companies)) %>%  
+                           str_sub(-4, -1) %>%
+                           as.integer,
+                         company = unique_companies 
+                         )
+
+#Check that the N of rows in npi_cyears is simply equal to the N of unique providers per year multiplied by the N of unique drugs
+npi_cyears[,.N]== y[year != 2020,
+                    uniqueN(npi_year)]*length(unique_companies) 
+
+#Merge npi_cyears with x, stratify by company and year (cs: data stratified)
+cs <- merge.data.table(x = npi_cyears, 
+                       y = x[, .(npi, year, company, amount, payments_n)],
+                       by = c("npi", "year", "company"),
+                       all.x = TRUE,
+                       all.y = FALSE)
+#Check that d has the same number of rows as npi_cyears
+cs[,.N] == npi_cyears[,.N]
+
+#If amount is NA (missing from OPD), insert a zero (no payments)
+cs[, amount := fifelse(amount == 0 | is.na(amount), 0, amount)]
+cs[, payments_n := fifelse(payments_n == 0 | is.na(payments_n), 0, payments_n)]
+
+#Add d_ytotal to cs
+cs <- rbindlist(list(cs, cyt), use.names = TRUE)
+
+#Group by year and drug
+yc <- cs[, .(amount = paste0(sum(payments_n) %>% comma, " | ", sum(amount) %>% round(0) %>% comma),
+             q50 = quantile(amount[amount > 0])["50%"],
+             q25 = quantile(amount[amount > 0])["25%"],
+             q75 = quantile(amount[amount > 0])["75%"],
+             n_paid = sum(amount > 0)
+             ), 
+         by = .(year, company)]
+
+#Replace NAs with 0
+yc <- yc %>%
+  mutate(across(.q(q25, q50, q75), ~ . %>% replace_na(0)))
+  
+#Add total N of neurologists prescribing MS drugs in a given year
+yc <- merge(yc,
+      npi_cyears[, .(n_total = uniqueN(npi)), by = year],
+      by = "year"
+)
+
+#Calculate % of prescribers receiving a payment
+yc$paid_prop <- (100*yc$n_paid/yc$n_total) %>% r1
+
+#Add the N of payments to paid_prop
+yc$paid_prop <- paste0(yc$n_paid %>% comma, " (", yc$paid_prop, ")") %>% str_squish
+
+#Create a column containing median & IQR
+yc$median_iqr <- ifelse(yc$q25 > 0,
+  paste0(yc$q50 %>% round(0) %>% comma,
+  " (", yc$q25 %>% round(0) %>% comma, 
+  " - ",
+  yc$q75 %>% round(0) %>% comma, ")"),
+  "No payments"
+)
+
+#Pivot to wide format
+yc <- yc %>%
+  pivot_wider(id_cols = c(company),
+              names_from = year,
+              values_from = .q( amount, n_paid, n_total, paid_prop, median_iqr)) %>% 
+  data.table
+
+#Place total row at the bottom
+yc <- rbind(yc[company != "Total"], yc[company == "Total"])
+
+#Arrange by type first and then alphabetical order of drug
+yc <- arrange(yc, company)
+yc <- merge(yc, ct, by = "company")
+```
+
+### Create & Save Table S2
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+#Rearrange columns
+yc <- yc %>% relocate(company, 
+                contains("2015"),
+                contains("2016"),
+                contains("2017"),
+                contains("2018"),
+                contains("2019"),
+                contains("2020"),
+                contains("total"))
+
+#Convert all columns to character
+yc <- sapply(yc, as.character) %>% data.table()
+
+#Convert to a flextable "t"
+t <- flextable(yc %>% select(-contains("n_paid"),
+                             -contains("n_total")))
+
+#Create a vector for years
+years_vector <- c(2015:2019, "total")
+
+#Create names of columns to be relabelled
+amount_cols <- paste0("amount_", years_vector)
+median_iqr_cols <- paste0("median_iqr_", years_vector)
+paid_prop_cols <- paste0("paid_prop_", years_vector)
+
+#Create an empty vector containing N of columns to be renamed (3) multiplied by number of years
+headers_list <- vector("list", length = length(years_vector)*3)
+
+#Assign list names
+names(headers_list) <- c(amount_cols, 
+                         paid_prop_cols, 
+                         median_iqr_cols)
+#Assign list content
+headers_list[1:(3*length(years_vector))] <- c("Number and value of payments, No. | $",
+                "Prescribers receiving payment, No. (%)",
+                "Median amount (IQR), $"
+                ) %>%
+  rep(each = length(years_vector))
+
+#Apply appropriate labels
+t <- set_header_labels(t, values = c(headers_list,
+                                     list(company = "Company")))
+#Add footnote for calculation of proportions
+t <- footnote(t, 
+         ref_symbols = footnote_symbol(1),
+         part = "header",
+         j = t$col_keys %>% str_detect("prop") %>% which,
+         value = as_paragraph("Proportions were calculated by dividing the number of neurologists making prescriptions and receiving payments in a given year by the number of neurologists making prescriptions in that year.")
+         )
+
+#Add footnote for calculation of proportions
+t <- footnote(t, 
+         ref_symbols = footnote_symbol(2),
+         part = "header",
+         j = t$col_keys %>% str_detect("amount_total") %>% which,
+         value = as_paragraph("Because this column represents the cumulative amount paid to any neurologist who prescribed 11+ MS drugs between 2015-2019, it will be higher than the sum of yearly amounts, as the latter only consider payments paid to a neurologist who prescribed 11+ MS drugs within the same year.")
+         )
+
+
+#Add header rows (yeaars)
+t <- add_header_row(t, 
+               values = c("", years_vector %>% str_to_title()),
+               colwidths = c(1, 3 %>% rep(length(years_vector)))
+               )
+
+#Create table borders
+t <- border_inner(t)
+t <- border_outer(t)
+
+#Bold first column
+t <- bold(t, j = c(1))
+
+#Apply some aesthetics to make the table more visually appropriate
+t <- flextable_aes(t, table_title = "Table. Industry payments to neurologists prescribing MS drugs by company, 2015 to 2019")
+
+#Merge column denoting total N of prescribers
+# t <- merge_v(t, j = which(colnames(yc) %>% str_detect("total")))
+
+#fontsize
+t <- fontsize(t, size = 7, part = "all")
+
+
+# (Re-)merge header rows
+t <- merge_h(t, part = "header")
+#Merge first 2 columns of last row denoting total
+t <- merge_h(t, i = nrow(yc))
+
+#Set width
+t <- set_table_properties(t, width = 0.1)
+
+#Save table as a word document
+save_as_docx(t, path = paste0("Tables/eTable 2 (", Sys.Date() , ").docx"))
+```
+
+### Create & Save Table 1
+
+```{r}
+#Convert all columns to character
+yc <- sapply(yc, as.character) %>% data.table()
+
+#Convert to a flextable "t"
+t <- flextable(yc %>% select(-contains("n_paid") &
+                             -contains("n_total") &
+                             (contains("_total")|contains("company")) ) %>%
+    mutate(n_payments_total = word(amount_total, 1),
+           amount_total = word(amount_total, -1)) %>%
+  relocate(company, n_payments_total, amount_total, paid_prop_total, median_iqr_total)
+  ) 
+
+
+
+#Apply appropriate labels
+t <- set_header_labels(t, 
+                       values = list(n_payments_total = "Number of payments, No.",
+                                     amount_total = "Total value of payments, $",
+                                     paid_prop_total = "Prescribers receiving payment, No. (%)",
+                                     median_iqr_total = "Median amount (IQR), $",
+                                     
+                                     company = "Company"))
+#Add footnote for calculation of proportions
+t <- footnote(t, 
+         ref_symbols = footnote_symbol(1),
+         part = "header",
+         j = t$col_keys %>% str_detect("prop") %>% which,
+         value = as_paragraph("Proportions were calculated by dividing the number of neurologists making prescriptions and receiving payments in a given year by the number of neurologists making prescriptions in that year.")
+         )
+
+#Create table borders
+t <- border_inner(t)
+t <- border_outer(t)
+
+#Bold first column
+t <- bold(t, j = c(1))
+
+#Apply some aesthetics to make the table more visually appropriate
+t <- flextable_aes(t, table_title = "Table 1. Industry payments to neurologists prescribing MS drugs by company, 2015 to 2019")
+
+#Merge column denoting total N of prescribers
+# t <- merge_v(t, j = which(colnames(yc) %>% str_detect("total")))
+
+#fontsize
+t <- fontsize(t, size = 12, part = "all")
+
+
+# (Re-)merge header rows
+t <- merge_h(t, part = "header")
+#Merge first 2 columns of last row denoting total
+t <- merge_h(t, i = nrow(yc))
+
+
+#Save table as a word document
+save_as_docx(t, path = paste0("Tables/Table 1 (", Sys.Date() , ").docx"))
+
+#Display the table
+t
+```
+
+### Create & Save Figure 1
+
+```{r, fig.width = 16, fig.height = 9, dpi = 600}
+
+#Filter those missing amounts (no payments received from a given company)
+fig1_df <- fig1_df[!is.na(amount)]
+
+#Remove N of payments (not used)
+fig1_df[, payments_n := NULL]
+
+#Arrange companies by outlier
+company_order <- fig1_df[!is.na(company), 
+                         .(max_amount = max(amount)), by = company] %>%
+  arrange(max_amount) %>%
+  pull(company) %>%
+  as.character %>%
+  c(., "Overall")
+
+fig1_df[, company := factor(company, levels = c(company_order))]
+
+#Plot
+ggplot(data = rbind(fig1_df,
+                    fig1_df[, .(amount = sum(amount),
+                          company = "Overall"), 
+                      by = npi]),
+       aes(x = company, 
+           y = amount, 
+           fill = company)) +
+  geom_violin(color = "black") +
+  #Set colors
+  scale_fill_tableau(name = "Company",
+                     palette = "Tableau 20") +
+  #Create title
+  ggtitle("Distribution of payments to physicians by company, 2015-2019",
+          subtitle = "The body of the violin plot indicates the amount of payments for most physicians and the tails of the violin plot extend to the outliers.") +
+  #X and Y axes aesthetics
+  scale_y_continuous(name = "Value of payments, $", 
+                     expand = c(0.0, 0.1),
+                   trans = "log",
+                   limits = c(0.4, 2250000),
+                   breaks = c(1, 10, 100, 1000, 10000, 100000, 1000000),
+                   labels = label_comma()) +
+  scale_x_discrete(name = NULL,
+                   labels = NULL) +
+  #Set theme
+  theme_pubclean() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.position = "bottom",
+        legend.text = element_text(size = 11, face = "bold"),
+        legend.title = element_text(face = "bold"),
+        legend.key.width = unit(1.5, "cm"),
+        legend.key.height = unit(0.75, "cm")
+  )
+
+ggsave(paste0("Figures/Figure 1 ", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+```
+
+## Supp Table 3 (payments by N of companies & year)
+
+### Create data
+
+```{r, warning = FALSE, message = FALSE, output = FALSE}
+
+#Create a data.frame to show the N of companies each MS prescriber was paid by
+n_comps_df <- merge(x = x[, 
+                          .(companies_n = uniqueN(company)),
+  by = .(npi, year)],
+      y = unique(y[year != 2020], by = "npi_year"),
+      by = c("npi", "year"),
+  all.x = FALSE, all.y = TRUE)
+
+#Convert N of companies to 0 if it is NA
+n_comps_df[, companies_n := fifelse(is.na(companies_n), 0, companies_n)]
+
+#Categorize physicians as unpaid, paid by 1, or paid by 2+
+n_comps_df[, companies_cats := fcase(
+  companies_n == 0, "No companies",
+  companies_n == 1, "1 company only",
+  companies_n >= 2, "2 companies or more"
+) %>%
+  fct_relevel("No companies", "1 company only")]
+
+#Stratify by year
+n_comps_year <- n_comps_df[,
+                           .N,
+                           by = .(year, companies_cats)] %>%
+  arrange(year, companies_cats)
+
+#Get n_companies per physician across 2015-2019
+n_comps_tots <- merge(x = x[year != 2014, .(companies_n = uniqueN(company)),
+                            by = .(npi)],
+      y = y[year != 2020, .(npi = npi %>% unique)],
+      by = c("npi"),
+  all.x = FALSE, all.y = TRUE)
+
+#Convert NA companies_n to Zeros
+n_comps_tots[, companies_n := fifelse(is.na(companies_n), 0, companies_n)]
+
+#Categorize physicians as unpaid, paid by 1, or paid by 2+
+n_comps_tots[, companies_cats := fcase(
+  companies_n == 0, "No companies",
+  companies_n == 1, "1 company only",
+  companies_n >= 2, "2 companies or more"
+) %>%
+  fct_relevel("No companies", "1 company only")]
+
+#Coalesce into a totals df
+n_comps_tots <- n_comps_tots[,
+                           .N,
+                           by = .(companies_cats)] %>%
+  arrange(companies_cats)
+
+#Create a column denoting that this is the total
+n_comps_tots[, year := "Total"]
+
+#Bind them together
+n_comps <- rbind(n_comps_year, n_comps_tots)
+
+#Create %s
+n_comps[, 
+        prop := (100*(N/sum(N))) %>%
+          round(1) %>%
+          format(nsmall = 1),
+        by = year]
+
+#Create a new column containing amount and props
+n_comps[, n_props := paste0(comma(N), " (", prop, ")")]
+#Delete the now-redundant columns
+n_comps[, .q(N, prop) := NULL]
+
+#Pivot wider
+n_comps <- n_comps %>% 
+  pivot_wider(id_cols = "companies_cats",
+              names_from = "year",
+              values_from = "n_props")
+```
+
+### Create Table
+
+```{r}
+
+#Convert to a flextable
+t <- n_comps %>% 
+  rename("Number of companies making payments" = "companies_cats") %>%
+  flextable
+
+#Save n_comps as data.table to make for easier referencing in the Results
+n_comps <- n_comps %>% as.data.table
+
+#Add header rows (yeaars)
+t <- add_header_row(t, 
+                    values = c("", 
+                              "Number of physicians receiving payments, N (%)"),
+                    colwidths = c(1, length(2015:2019) + 1)
+)
+
+#Create table borders
+t <- border_inner(t)
+t <- border_outer(t)
+
+#Bold first column
+t <- bold(t, j = c(1))
+
+#Apply some aesthetics to make the table more visually appropriate
+t <- flextable_aes(t, table_title = "eTable 3. Number of physicians receiving payments from no companies, one company, or two or more companies, 2015 to 2019")
+
+#fontsize
+t <- fontsize(t, size = 12, part = "all")
+
+#Save table as a word document
+save_as_docx(t, path = paste0("Tables/eTable 3 (", Sys.Date() , ").docx"))
+
+#Display the table
+t
+
+```
+
+## Regression Analyses
+
+### Setup Data for Regression
+
+#### Create data.table (provider/drug)
+
+```{r, output = FALSE}
+#Remove variable with a name we're going to reuse
+rm(specific_drug_label)
+#Mark y with the drug the payment was made for from our pre-constructed list of drugs
+foreach(specific_drug = drug_names_df[specific_drug_label %nin% 
+                                        c("All", 
+                                          "All oral drugs", 
+                                          "All injectable drugs",
+                                          "All infusable drugs"), 
+                                      specific_drug],
+        specific_drug_label = drug_names_df[specific_drug_label %nin% 
+                                              c("All", 
+                                                "All oral drugs", 
+                                                "All injectable drugs",
+                                                "All infusable drugs"), 
+                                            specific_drug_label]
+) %do% {
+  
+  #Mark y
+  y[grepl(pattern = specific_drug %>% str_remove(" \\(.*?\\)"), x = prescribed_drug),
+    prescribed_drug := specific_drug_label  %>% str_remove(" \\(.*?\\)") %>% factor]
+}
+
+#Match drugs to companies
+y[, company := kit::nif(
+grepl(x = prescribed_drug, pattern = "(?i)Aubagio"), "Sanofi, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Avonex"), "Biogen, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Betaseron"), "Bayer Healthcare, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Copaxone"), "Teva Pharmaceuticals, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Dimethyl Fumarate"), "Mylan, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Extavia"), "Novartis, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Gilenya"), "Novartis, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Glatiramer Acetate"), "Mylan, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Glatopa"), "Novartis, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Kesimpta"), "Novartis, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Mavenclad"), "Merck, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Mayzent"), "Novartis, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Ocrevus"), "F. Hoffmann-La Roche, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Plegridy"), "Biogen, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Rebif"), "Merck, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Tecfidera"), "Biogen, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Tysabri"), "Biogen, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Vumerity"), "Alkermes, Inc.",
+grepl(x = prescribed_drug, pattern = "(?i)Zeposia"), "Celgene Corporation",
+default = prescribed_drug
+) %>% factor]
+
+##Check which companies show  up in one dataframe but not the other
+#This should be Pfizer only (since Rebif was assigned to Merck)
+companies_x_not_y <- setdiff(x[, unique(company)], y[, unique(company)])
+#This should be Alkermes only, since its drug (Vumerity) is not on the OPD
+companies_y_not_x <- setdiff(y[, unique(company)], x[, unique(company)])
+
+#N of drugs each eligible prescriber may have chosen from
+n_eligible_drugs <- y[year != 2020, uniqueN(prescribed_drug)]
+#N of drugs including next year (ny)
+n_eligible_drugs_ny <- y[, uniqueN(prescribed_drug)]
+
+#N of companies each eligible prescriber may have chosen from
+n_eligible_companies <- length(unique_companies) - length(c(companies_x_not_y))
+
+#Number of years being analyzed
+n_eligible_years <- length(2015:2019)
+#And for the next-year analysis
+n_eligible_years_ny <- length(2015:2020)
+
+#Create a data.table containing a unique combination of NPI, year, and eligible companies
+cdata <- data.table(
+  npi = y[year != 2020, unique(npi)] %>% 
+    rep(each = n_eligible_drugs * n_eligible_years),
+  year = (2015:2019) %>% 
+    rep(each = n_eligible_drugs) %>% 
+    rep(times = y[year != 2020, uniqueN(npi)]),
+  prescribed_drug = y[year != 2020, unique(prescribed_drug)] %>% 
+    rep(times = n_eligible_years) %>% 
+    rep(times = y[year != 2020, uniqueN(npi)])
+)
+
+#Classify into mid and high drugs
+mid_drugs <- c("Avonex", "Plegridy", "Rebif", "Betaseron", "Glatiramer Acetate",
+                       "Copaxone", "Aubagio", "Tecfidera", "Dimethyl Fumurate",
+                       "Vumerity")
+high_drugs <- c("Gilenya", "Zeposia", "Mayzent", "Tysabri",
+                       "Ocrevus", "Kesimpta", "Lemtrada", "Mavenclad")
+#Create a moderate-efficacy version of cdata
+cdata_mid <- cdata[prescribed_drug %in%
+                     mid_drugs]
+#Create a high-efficacy version of cdata
+cdata_high <- cdata[prescribed_drug %in%
+                     high_drugs]
+
+#cdata for ny analysis
+cdata_ny <- data.table(
+  npi = y[, unique(npi)] %>%
+    rep(each = n_eligible_drugs_ny * n_eligible_years_ny),
+  year = (2015:2020) %>% 
+    rep(each = n_eligible_drugs_ny) %>%
+    rep(times = y[, uniqueN(npi)]),
+  prescribed_drug = y[, unique(prescribed_drug)] %>%
+    rep(times = n_eligible_years_ny) %>% 
+    rep(times = y[, uniqueN(npi)])
+)
+
+#Check that the N of rows is indeed equal to the unique three-way combination
+cdata[,.N] == y[year != 2020, uniqueN(npi)] * n_eligible_drugs * n_eligible_years
+cdata_ny[,.N] == y[, uniqueN(npi)] * n_eligible_drugs_ny * n_eligible_years_ny
+
+#Function to match drugs to companies in cdata
+add_company_names <- function(prescribed_drug) kit::nif(
+  grepl(x = prescribed_drug, pattern = "(?i)Aubagio"), "Sanofi, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Avonex"), "Biogen, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Betaseron"), "Bayer Healthcare, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Copaxone"), "Teva Pharmaceuticals, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Dimethyl Fumarate"), "Mylan, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Extavia"), "Novartis, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Gilenya"), "Novartis, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Glatiramer Acetate"), "Mylan, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Glatopa"), "Novartis, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Kesimpta"), "Novartis, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Mavenclad"), "Merck, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Mayzent"), "Novartis, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Ocrevus"), "F. Hoffmann-La Roche, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Plegridy"), "Biogen, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Rebif"), "Merck, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Tecfidera"), "Biogen, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Tysabri"), "Biogen, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Vumerity"), "Alkermes, Inc.",
+  grepl(x = prescribed_drug, pattern = "(?i)Zeposia"), "Celgene Corporation",
+  default = prescribed_drug
+) %>% factor
+
+#Apply function to cdata and cdata_ny
+cdata[, company := add_company_names(prescribed_drug)]
+cdata_ny[, company := add_company_names(prescribed_drug)]
+cdata_mid[, company := add_company_names(prescribed_drug)]
+cdata_high[, company := add_company_names(prescribed_drug)]
+
+#Combine cdata with y
+cdata <- merge.data.table(
+  x = cdata,
+  y = y[year != 2020 & company != companies_y_not_x][, 
+                                                     .(n_prescriptions = sum(n_prescriptions)),
+                                                     by = .(npi, year, company, prescribed_drug)],
+  by = c("npi", "year", "company", "prescribed_drug"),
+  all.x = TRUE, all.y = FALSE
+)
+#for cdata_ny
+cdata_ny <- merge.data.table(
+  x = cdata_ny,
+  y = y[company != companies_y_not_x][, .(n_prescriptions = sum(n_prescriptions)),
+                                                     by = .(npi, year, company, prescribed_drug)],
+  by = c("npi", "year", "company", "prescribed_drug"),
+  all.x = TRUE, all.y = FALSE
+)
+#for cdata_mid
+cdata_mid <- merge.data.table(
+  x = cdata_mid,
+  y = y[year != 2020 & company != companies_y_not_x][, 
+                                                     .(n_prescriptions = sum(n_prescriptions)),
+                                                     by = .(npi, year, company, prescribed_drug)],
+  by = c("npi", "year", "company", "prescribed_drug"),
+  all.x = TRUE, all.y = FALSE
+)
+#for cdata_high
+cdata_high <- merge.data.table(
+  x = cdata_high,
+  y = y[year != 2020 & company != companies_y_not_x][, 
+                                                     .(n_prescriptions = sum(n_prescriptions)),
+                                                     by = .(npi, year, company, prescribed_drug)],
+  by = c("npi", "year", "company", "prescribed_drug"),
+  all.x = TRUE, all.y = FALSE
+)
+
+
+# Remove all pairs of physician-years in cdata which don't appear in y (represents inactive years where no MS drugs was prescribed 11+ times)
+cdata <- cdata[paste0(npi, "_", year) %in% y[year != 2020, npi_year]]
+cdata_ny <- cdata_ny[paste0(npi, "_", year) %in% y[, npi_year]]
+cdata_mid <- cdata_mid[paste0(npi, "_", year) %in% y[prescribed_drug %in% mid_drugs &
+                                                     year != 2020, npi_year]]
+cdata_high <- cdata_high[paste0(npi, "_", year) %in% y[prescribed_drug %in% high_drugs & 
+                                                         year != 2020, npi_year]]
+```
+
+#### Imputing missing prescriptions
+
+```{r, output = FALSE}
+###Three approaches to impute missing data
+##########################################
+##Approach 1:
+#Replace missing samples with a random integer from 0 to 10
+cdata_uni <- copy(cdata)
+cdata_uni[is.na(n_prescriptions), 
+          n_prescriptions := sample(0:10,
+                                    cdata_uni[is.na(n_prescriptions), .N],
+                                    replace = TRUE)]
+#For mid analysis
+cdata_mid_uni <- copy(cdata_mid)
+cdata_mid_uni[is.na(n_prescriptions), 
+          n_prescriptions := sample(0:10,
+                                    cdata_mid_uni[is.na(n_prescriptions), .N],
+                                    replace = TRUE)]
+#For high analysis
+cdata_high_uni <- copy(cdata_high)
+cdata_high_uni[is.na(n_prescriptions), 
+          n_prescriptions := sample(0:10,
+                                    cdata_high_uni[is.na(n_prescriptions), .N],
+                                    replace = TRUE)]
+
+#For ny analysis
+cdata_ny_uni <- copy(cdata_ny)
+cdata_ny_uni[is.na(n_prescriptions), 
+          n_prescriptions := sample(0:10,
+                                    cdata_ny_uni[is.na(n_prescriptions), .N],
+                                    replace = TRUE)]
+
+
+##Approach 2:
+#Replace with a zero
+cdata_zero <- copy(cdata)
+cdata_zero[is.na(n_prescriptions), n_prescriptions := 0]
+#For ny analysis
+cdata_ny_zero <- copy(cdata_ny)
+cdata_ny_zero[is.na(n_prescriptions), n_prescriptions := 0]
+#For mid analysis
+cdata_mid_zero <- copy(cdata_mid)
+cdata_mid_zero[is.na(n_prescriptions), n_prescriptions := 0]
+#For high analysis
+cdata_high_zero <- copy(cdata_high)
+cdata_high_zero[is.na(n_prescriptions), n_prescriptions := 0]
+
+##Approach 3:
+#Replace with a similar distribution (beta-binomial)
+cdata_rbinom <- copy(cdata)
+cdata_rbinom[is.na(n_prescriptions), n_prescriptions := rbbinom(size = 10, 
+                                                       n = cdata_rbinom[is.na(n_prescriptions), .N],
+                                                       alpha = 0.3, beta = 1)]
+
+#For ny analysis
+cdata_ny_rbinom <- copy(cdata_ny)
+cdata_ny_rbinom[is.na(n_prescriptions), n_prescriptions := rbbinom(size = 10, 
+                                                       n = cdata_ny_rbinom[is.na(n_prescriptions), .N],
+                                                       alpha = 0.3, beta = 1)]
+#For mid
+cdata_mid_rbinom <- copy(cdata_mid)
+cdata_mid_rbinom[is.na(n_prescriptions), n_prescriptions := rbbinom(size = 10, 
+                                                       n = cdata_mid_rbinom[is.na(n_prescriptions), .N],
+                                                       alpha = 0.3, beta = 1)]
+#For high
+cdata_high_rbinom <- copy(cdata_high)
+cdata_high_rbinom[is.na(n_prescriptions), n_prescriptions := rbbinom(size = 10, 
+                                                       n = cdata_high_rbinom[is.na(n_prescriptions), .N],
+                                                       alpha = 0.3, beta = 1)]
+
+
+#Sanity check
+sum(cdata_uni$n_prescriptions) > sum(cdata_rbinom$n_prescriptions)
+sum(cdata_rbinom$n_prescriptions) > sum(cdata_zero$n_prescriptions)
+```
+
+#### Trends in drug choice & N of prescribers
+
+##### Create data
+
+```{r}
+#Create a list containing prescription data (plist)
+plist <- foreach(cdata = list(cdata_rbinom,
+                     cdata_zero,
+                     cdata_uni)) %do% {
+                       
+                       #Coalesce yearly trends of drug prescriptions
+                       yearly_drug_trends <- cdata[, 
+                     .(prescriptions = sum(n_prescriptions)),
+                      by = .(year, prescribed_drug)]
+                       #Stratified_by_year
+                       yearly_drug_trends <- yearly_drug_trends[, 
+                                                  .(prop = prescriptions
+                                                    /sum(prescriptions),
+                               drug = prescribed_drug), year]
+                       
+                       #For all years from 2015-2019
+                       total_drug_trends <- cdata[, 
+                     .(prescriptions = sum(n_prescriptions)),
+                      by = .(prescribed_drug)]
+                       #Overall
+                       total_drug_trends <- total_drug_trends[, 
+                                                  .(prop = prescriptions
+                                                    /sum(prescriptions),
+                                                    drug = prescribed_drug)]
+                       
+                       #Bind together yearly and totals
+                       drug_trends <- rbind(total_drug_trends %>%
+                               mutate(year = "Overall"), 
+                             yearly_drug_trends)
+                       
+                       #Calculate N of prescriptions by top 10%
+                      top10_n <- cdata[, .(prescriptions = sum(n_prescriptions)),
+                             by = .(npi)][prescriptions >=
+                            quantile(prescriptions,
+                              c(0.90)), sum(prescriptions)]
+                      
+                      #Calculate N of prescriptions by top 1%
+                      top1_n <- cdata[, .(prescriptions = sum(n_prescriptions)),
+                             by = .(npi)][prescriptions >=
+                            quantile(prescriptions,
+                              c(0.99)), sum(prescriptions)]
+                      
+                      #Calculate N of prescriptions
+                      total_n <- cdata[, sum(n_prescriptions)]
+                      iqr_n <- cdata[, 
+                                     .(prescriptions = sum(n_prescriptions)),
+                                     by = npi][, quantile(prescriptions)]
+                      
+                      #Combine relevant findings into a list
+                      list(total_n = total_n,
+                           iqr_n = iqr_n,
+                           top10_n = top10_n,
+                           top1_n = top1_n,
+                           drug_trends = drug_trends)
+                     }
+names(plist) <- c("rbinom", "zero", "uni")
+```
+
+##### Create Table (Drug trends)
+
+```{r}
+#Foreach loop under 3 imputation patterns
+foreach(tab_data = list(
+  plist$rbinom$drug_trends, 
+  plist$zero$drug_trends, 
+  plist$uni$drug_trends
+)) %do% {
+
+  
+  #Convert to flextable
+  t <- tab_data %>% 
+    pivot_wider(names_from = year,
+                values_from = prop) %>%
+    flextable
+  
+  flextable_aes(t,
+                table_title = "eTable ")
+}
+  
+t <- data.frame()
+for(tab_data in list(
+  plist$rbinom$drug_trends, 
+  plist$zero$drug_trends, 
+  plist$uni$drug_trends
+))  {
+  #Convert to wide format
+  t <- rbind(t, 
+             tab_data %>% 
+    pivot_wider(names_from = year,
+                values_from = prop))
+}
+ t$imp <- c("Beta-binomial", "Zero", "Uniform") %>%
+   rep(each = 15)
+ 
+ t %>% 
+   mutate(across(where(is.numeric), ~ (. * 100) %>% r1)) %>%
+   rename(Drug = drug,
+          `Imputation Pattern` = imp) %>%
+   flextable %>%
+   flextable_aes("eTable 4. Prescription patterns of MS disease-modifying therapies by drug, 2015-2019.") %>%
+   border_inner %>%
+   border_outer %>%
+   bold(j = 1) %>%
+   merge_v(j = 8) %>%
+   flextable::width(width = 0.8, unit = "in") %>%
+   save_as_docx(path = paste0("Tables/eTable 4 (", Sys.Date(), ").docx"))
+```
+
+##### Create Table (Top/Prop of prescribers)
+
+```{r}
+#Top % of prescribers share
+table <- tibble(`Total N of prescriptions`= character(0),
+                `Median (IQR) N of prescriptions per provider` = character(0),
+                `N of prescriptions by top 10% of providers` = character(0),
+                `N of prescriptions by top 1% of providers` = character(0),
+                `Proportion of prescriptions by top 10% of providers (%)` = character(0))
+for(tab_data in list(
+  plist$rbinom, 
+  plist$zero, 
+  plist$uni
+)) {
+  
+  table <- table %>%
+    add_row(`Total N of prescriptions`= tab_data$total_n %>% comma,
+                `Median (IQR) N of prescriptions per provider` = paste0(
+                  tab_data$iqr_n["50%"], " (", tab_data$iqr_n["25%"], " to ", tab_data$iqr_n["75%"], ")"
+                ),
+                `N of prescriptions by top 10% of providers` = tab_data$top10_n %>% comma,
+                `N of prescriptions by top 1% of providers` = tab_data$top1_n %>% comma,
+                `Proportion of prescriptions by top 10% of providers (%)` = (100*tab_data$top10_n/tab_data$total_n) %>% format(digits = 3, nsmall = 1))
+  
+}
+
+table %>%
+  mutate(`Imputation pattern` = c("Beta-binomial",
+                                  "Zero",
+                                  "Uniform")) %>%
+  flextable %>%
+   flextable_aes("eTable 5. Prescription patterns of MS disease-modifying therapies by provider, 2015-2019.") %>%
+   border_inner %>%
+   border_outer %>%
+   bold(j = 1) %>%
+   flextable::width(width = 1.2, unit = "in") %>%
+   save_as_docx(path = paste0("Tables/eTable 5 (", Sys.Date(), ").docx"))
+```
+
+##### Extract most common 2 drugs
+
+```{r}
+#Get highest drug
+max_drug <- plist$rbinom$drug_trends[year == "Overall"][prop == max(prop), drug]
+max_prop <- plist$rbinom$drug_trends[year == "Overall",
+                                     (max(prop)*100) %>% r1]
+#Get 2nd highest drug
+max2_drug <- plist$rbinom$drug_trends[year == "Overall" & drug != max_drug][
+  prop == max(prop), drug
+]
+max2_prop <- plist$rbinom$drug_trends[year == "Overall" & drug != max_drug,
+                                      (max(prop)*100) %>% r1]
+```
+
+#### Coalesce by company & merge w/ x
+
+```{r, output = FALSE}
+
+#Remove old cdata and cdata_ny object
+rm(cdata)
+rm(cdata_ny)
+
+#Start a foreach loop
+cdata <- foreach(cdata = list(cdata_uni, cdata_zero, cdata_rbinom,
+                              cdata_mid_uni, cdata_mid_zero, cdata_mid_rbinom,
+                              cdata_high_uni, cdata_high_zero, cdata_high_rbinom,
+                              cdata_ny_uni, cdata_ny_zero, cdata_ny_rbinom),
+                 ny = c(0 %>% rep(9), 1 %>% rep(3))) %do% {
+##########################################
+#Coalesce by company
+cdata <- cdata[, 
+               .(n_prescriptions = sum(n_prescriptions)), 
+               by = .(npi, year, company)]
+
+#Set excluded year in y and x according to whether we're conducting a same-year or next-year analysis
+excl_y <- ifelse(ny == 0, 2020, 3000)
+excl_x <- ifelse(ny == 0, 2014, 3000)
+
+#Get N of unique eligible companies PER YEAR
+unique_year_companies <- y[year != excl_y & !is.na(n_prescriptions), 
+                               .(company = unique(company)), 
+                           by = year] %>%
+  mutate(year_company = paste0(year, company)) %>%
+  pull(year_company)
+
+#Create the same column in cdata
+cdata[, year_company := paste0(year, company)]
+
+#Filter out those rows in cdata which don't match unique_year_companies
+cdata <- cdata[year_company %in% unique_year_companies]
+
+#Combine x and cdata
+cdata <- merge.data.table(x = cdata,
+                          y = x %>% mutate(year = year + ny),
+                          by = c("npi", "year", "company"),
+                          all.x = TRUE,
+                          all.y = FALSE)
+
+#Combine x_pn and cdata for 2015-2019
+cdata <- merge.data.table(x = cdata,
+                          y = x_pn %>% mutate(year = year + ny),
+                          by = c("npi", "year", "company"),
+                          all.x = TRUE,
+                          all.y = FALSE)
+
+#Fill up NA payment types with 0
+setnafill(cdata, fill = 0, cols = payment_types_names)
+
+#Add columns for total payments and total amount
+cdata <- merge.data.table(x = cdata,
+                           y = x[company %nin% companies_x_not_y,
+                                 .(total_amount = sum(amount),
+                                   total_payments_n = sum(payments_n)),
+                                 by = .(npi, year)] %>%
+                            mutate(year = year + ny),
+                           by = c("npi", "year"),
+                           all.x = TRUE,
+                           all.y = FALSE)
+
+#If amount or payments_n is NA (missing from OPD)
+cdata[, amount := fifelse(is.na(amount), 0, amount)]
+cdata[, total_amount := fifelse(is.na(total_amount), 0, total_amount)]
+
+#Add the other_amount column for payments from other companies
+cdata[, other_amount := total_amount - amount]
+cdata[, other_amount := fifelse(is.na(other_amount), 0, other_amount)]
+
+#Repeat for payments_n
+cdata[, payments_n := fifelse(is.na(payments_n), 0, payments_n)]
+cdata[, total_payments_n := fifelse(is.na(total_payments_n), 0, total_payments_n)]
+cdata[, other_payments_n := total_payments_n - payments_n]
+cdata[, other_payments_n := fifelse(is.na(other_payments_n), 0, other_payments_n)]
+
+#Sanity check: that the different types of payments add up to the amount received
+cdata[, all.equal(food_bev + consult + non_consult + other + travel + educ, amount)]
+
+#Store the amounts columns in separate columns (because they will soon be changed to yes/no indicators)
+cdata <- cbind(cdata, cdata[, .SD, .SDcols = payment_types_names] %>%
+          setnames(.,
+                   old = payment_types_names,
+                   new = paste0(payment_types_names %>%
+                     str_replace("other", "other_type"), "_amount")))
+
+#Convert the amounts for the various sub-payments to categorical yes/no variables
+cdata[,
+  (payment_types_names) := lapply(.SD,
+                                  function(x) as.numeric(x > 0)),
+  .SDcols = payment_types_names]
+
+#Sanity checks:
+#Check that the amount of payments in cdata is no different from x
+x[year != excl_x &
+    paste0(npi, "_", year + ny) %in% y[year != excl_y, paste0(npi, "_", year)] &
+    company %nin% companies_x_not_y,
+  sum(amount)] == cdata[, .(total_amount = first(total_amount)), 
+                        by = .(npi, year)][, sum(total_amount)]
+
+#Do the same for payments_n
+x[year != excl_x &
+    paste0(npi, "_", year + ny) %in% y[year != excl_y, npi_year] &
+    company %nin% companies_x_not_y,
+  sum(payments_n)] == cdata[, .(total_payments_n = first(total_payments_n)), 
+                            by = .(npi, year)][, sum(total_payments_n)]
+
+
+#Add an indicator for having received something from the company of the drug
+cdata[, paid := as.numeric(amount > 0)]
+
+#From a company other than of the drug
+cdata[, other_paid := as.numeric(other_amount > 0)]
+
+#A factor variable of receiving payments from the manufacturer
+cdata[, paid_by := fcase(amount > 0 & other_amount == 0,
+                           "Same company only", 
+                           amount == 0 & other_amount > 0,
+                           "Different company only",
+                           amount > 0 & other_amount > 0,
+                           "Both companies",
+                           amount == 0 & other_amount == 0,
+                           "Not paid"
+                           ) %>% fct_relevel("Not paid")]
+
+
+#Save N of rows (to be used for a latter check a few lines down)
+current_n <- cdata[, .N]
+
+#Calculate total N of prescriptions per year and NPI
+cdata <- merge.data.table(
+  cdata,
+  cdata[, .(total_prescriptions = sum(n_prescriptions)), by = .(npi, year)],
+  by = c("npi", "year")
+)
+
+#Check that the N of rows has not changed
+cdata[, .N] == current_n
+#Check that the total N of prescriptions add up
+cdata[, sum(n_prescriptions)] == cdata[, .(total_prescriptions = first(total_prescriptions)), by = .(npi, year)][, sum(total_prescriptions)]
+
+#Return cdata
+cdata
+}
+
+#Name the cdata list
+names(cdata) <- c("uni", "zero", "rbinom", 
+                  "uni_mid", "zero_mid", "rbinom_mid", 
+                  "uni_high", "zero_high", "rbinom_high", 
+                  "ny_uni", "ny_zero", "ny_rbinom")
+#Put mid/high analysis in a separate object
+cdata_mid_high <- list(cdata$rbinom_mid, cdata$rbinom_high,
+                       cdata$uni_mid, cdata$uni_high,
+                       cdata$zero_mid, cdata$zero_high)
+names(cdata_mid_high) <- c("rbinom_mid", "rbinom_high",
+                           "uni_mid", "uni_high",
+                           "zero_mid", "zero_high")
+#Remove from cdata
+cdata <- list(cdata$uni, cdata$zero, cdata$rbinom,
+              cdata$ny_uni, cdata$ny_zero, cdata$ny_rbinom)
+names(cdata) <- c("uni", "zero", "rbinom",
+                  "ny_uni", "ny_zero", "ny_rbinom")
+```
+
+### Model
+
+#### Yearly analyses
+
+```{r}
+
+start <- Sys.time()
+#Set up a parallel cluster to speed things up
+cl <- makeCluster(6)
+registerDoParallel(cl)  
+if(!file.exists("Model Results.RData")) {
+#Store model results under different imputation methods
+mres <- foreach(d = cdata,
+        imp_method = c("Uniform", "Zero", "Beta-Binomial",
+                       "Uniform (NY)", "Zero (NY)", "Beta-Binomial (NY)"),
+        .packages = c("glmmTMB", "emmeans", "data.table",
+                      "dplyr", "stringr", "splines", "Hmisc")
+        ) %dopar% {
+          
+#Convert year to factor
+d[, year := factor(year)]
+                         
+#Create NPI_company to use in AR1
+d[, npi_company := paste0(npi, company) %>% factor]
+                         
+#Model prescription of a company's drugs as a function of having received payments from it (Model 1)
+start <- Sys.time()
+m1 <- glmmTMB(data = d,
+              control = glmmTMBControl(parallel = 2),
+             family = binomial,
+             formula =
+              cbind(n_prescriptions, 
+                    total_prescriptions - n_prescriptions) 
+             ~
+                paid  + 
+             company + 
+               ns(other_amount, 
+                  knots = quantile(other_amount, c(0.4, 0.5, 0.6, 0.7,
+                                                   0.8, 0.9, 0.95, 0.98)),
+                  Boundary.knots = c(0, quantile(other_amount, 0.99))) +
+               ar1(year + 0|npi_company)
+             )
+Sys.time() - start
+#Tabulate the results of model 1
+m1_results <- m1 %>% 
+  confint %>%
+  data.frame %>%
+  tibble::rownames_to_column() %>%
+  rename(paid_by = rowname,
+         lci = "X2.5..",
+         uci = "X97.5..",
+         pe = Estimate) %>%
+  filter(paid_by %>% str_detect("paid")) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ . %>% 
+           exp %>%
+           round(2) %>%
+           format(nsmall = 1))) %>%
+  mutate(odds_ratio = paste0(pe, " (", lci, " to ", uci, ")"),
+         paid_by = paid_by %>% str_remove("paid_by"),
+         imputation_method = imp_method
+         )
+#Remove m1
+rm(m1)
+
+#Model prescription of a company's drugs as a function of having received payments from it OR other companies OR both OR none at all (Model 2)
+m2 <- glmmTMB(data = d,
+             family = binomial,
+             control = glmmTMBControl(parallel = 2),
+             formula =
+              cbind(n_prescriptions,
+                    total_prescriptions - n_prescriptions) 
+             ~
+                paid_by + company + ar1(year + 0|npi_company)
+             )
+#Tabulate the results of model 2
+m2_results <- m2 %>% 
+  confint %>%
+  data.frame %>%
+  tibble::rownames_to_column() %>%
+  rename(paid_by = rowname,
+         lci = "X2.5..",
+         uci = "X97.5..",
+         pe = Estimate) %>%
+  filter(paid_by %>% str_detect("paid_by")) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ . %>% 
+           exp %>%
+           round(2) %>%
+           format(nsmall = 1))) %>%
+  mutate(odds_ratio = paste0(pe, " (", lci, " to ", uci, ")"),
+         paid_by = paid_by %>% str_remove("paid_by"),
+         imputation_method = imp_method
+         ) 
+#Remove m2
+rm(m2)
+
+#Model prescription of a company's drugs as a function of the type of payment received (Model 3)
+m3 <- glmmTMB(data = d,
+             family = binomial,
+             control = glmmTMBControl(parallel = 2),
+             formula =
+              cbind(n_prescriptions,
+                    total_prescriptions - n_prescriptions) 
+             ~
+                food_bev + travel + educ +
+               consult + non_consult + other +
+               company +
+               ns(other_amount, 
+                  knots = quantile(other_amount, c(0.4, 0.5, 0.6, 0.7,
+                                                   0.8, 0.9, 0.95, 0.98)),
+                  Boundary.knots = c(0, quantile(other_amount, 0.99))) +
+               ar1(year + 0|npi_company)
+             )
+
+#Tabulate the results of model 3
+m3_results <- m3 %>% 
+  confint %>%
+  data.frame %>%
+  tibble::rownames_to_column() %>%
+  rename(paid_by = rowname,
+         lci = "X2.5..",
+         uci = "X97.5..",
+         pe = Estimate) %>%
+  filter(paid_by %>% str_detect(payment_types_names %>%
+                                  paste0(collapse = "|"))) %>%
+  filter(!paid_by %>% str_detect("other_amount")) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ . %>% 
+           exp %>%
+           round(2) %>%
+           format(nsmall = 1))) %>%
+  mutate(odds_ratio = paste0(pe, " (", lci, " to ", uci, ")"),
+         paid_by = paid_by %>% str_remove("paid_by"),
+         imputation_method = imp_method
+         ) 
+#Remove m3
+rm(m3)
+
+#Model prescription of a company's drugs as a function of the amount that was received
+m4 <- glmmTMB(data = d,
+             family = binomial,
+              control = glmmTMBControl(parallel = 2),
+             formula =
+              cbind(n_prescriptions,
+                    total_prescriptions - n_prescriptions) 
+             ~
+                company + 
+               ns(amount,
+           knots = quantile(amount, c(0.7, 0.8, 0.9, 0.95, 0.98)),
+           Boundary.knots = c(0, quantile(amount, 0.99))) +
+             ns(other_amount, 
+           knots = quantile(other_amount, c(0.4, 0.5, 0.6, 0.7,
+                                            0.8, 0.9, 0.95, 0.98)),
+           Boundary.knots = c(0, quantile(other_amount, 0.99))) +
+             ar1(year + 0|npi_company)
+             )
+
+#Tabulate the results of m4 (Amount)
+m4_results <- m4 %>%
+  emmeans(trt.vs.ctrl ~ amount,
+          at = list(amount = seq(0, 10000, 5)),
+          nuisance = "company") %>%
+  {.$contrasts} %>%
+  confint(adjust = "none") %>%
+  data.frame %>%
+  rename(lci = asymp.LCL, #Flipped because will invert
+         uci =  asymp.UCL,
+         pe = estimate) %>%
+  mutate(contrast = word(contrast, 1) %>% 
+           str_remove("^amount") %>%
+           as.numeric) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ exp(.))) %>%
+  mutate(odds_ratio = paste0(pe  %>% round(2) %>% format(nsmall = 2),
+                             " (", lci  %>% round(2) %>% format(nsmall = 2),
+                             " to ",
+                             uci  %>% round(2) %>% format(nsmall = 2),
+                             ")"),
+         imputation_method = imp_method
+         ) %>%
+  select(contrast, pe, lci, uci, odds_ratio, imputation_method)
+
+
+#Remove m4
+rm(m4)
+
+#Store in a list
+list(m1 = m1_results %>% data.table, 
+     m2 = m2_results %>% data.table,
+     m3 = m3_results %>% data.table,
+     m4 = m4_results %>% data.table)
+        }
+
+#Name the models
+names(mres) <- c("uniform", "zero", "rbinom",
+                 "uniform_ny", "zero_ny", "rbinom_ny")
+
+} else {
+  mres <- qread("Model Results.RData")
+}
+Sys.time() - start
+stopCluster(cl)
+#Save
+qsave(mres, "Model Results.RData")
+```
+
+#### Mid/High-efficacy analyses
+
+```{r}
+#Coalesce mid/high together (to do interactions)
+list(
+list(cdata_mid_high$rbinom_mid[, efficacy := "Mid"], 
+     cdata_mid_high$rbinom_high[, efficacy := "High"]) %>% rbindlist,
+list(cdata_mid_high$uni_mid[, efficacy := "Mid"], 
+     cdata_mid_high$uni_high[, efficacy := "High"]) %>% rbindlist,
+list(cdata_mid_high$zero_mid[, efficacy := "Mid"], 
+     cdata_mid_high$zero_high[, efficacy := "High"]) %>% rbindlist
+) -> cdata_mid_high
+names(cdata_mid_high) <- c("rbinom", "uni", "zero")
+
+start <- Sys.time()
+#Set up a parallel cluster to speed things up
+cl <- makeCluster(6)
+registerDoParallel(cl)  
+
+if(!file.exists("Model Results (Mid-High Efficacy).RData")) {
+#Store model results under different imputation methods
+mid_high_res <- foreach(
+        d = cdata_mid_high,
+        imp_method = c("Beta-Binomial",
+                       "Uniform",
+                       "Zero"),
+        .packages = c("glmmTMB", "emmeans", "data.table",
+                      "dplyr", "stringr", "splines", "Hmisc")
+        ) %dopar% {
+          
+#Convert year to factor
+d[, year := factor(year)]
+                         
+#Create NPI_company to use in AR1
+d[, npi_company := paste0(npi, company) %>% factor]
+      
+#Recombine drug totals (summing across mid and high efficacy drugs)                   
+d <- merge(
+  d %>% dplyr::select(-total_prescriptions, -other_amount)
+  ,
+  d[, .(total_prescriptions = sum(n_prescriptions),
+        other_amount = sum(other_amount)
+        ),
+  by = c("npi", "year")]
+)
+
+#Create a combined npi-company-efficacy variable for the temporal autocorrelation
+d[, npi_company_efficacy := paste0(npi_company, efficacy)]
+
+#Model prescription of a company's drugs as a function of having received payments from it (Model 1)
+start <- Sys.time()
+m1 <- glmmTMB(data = d,
+              control = glmmTMBControl(parallel = 2),
+             family = binomial,
+             formula =
+              cbind(n_prescriptions, 
+                    total_prescriptions - n_prescriptions) 
+             ~
+                paid*efficacy  + 
+             company*efficacy + 
+               efficacy*ns(other_amount, 
+                  knots = quantile(other_amount, c(0.4, 0.5, 0.6, 0.7,
+                                                   0.8, 0.9, 0.95, 0.98)),
+                  Boundary.knots = c(0, quantile(other_amount, 0.99))) +
+               ar1(year + 0|npi_company_efficacy)
+             )
+Sys.time() - start
+
+#Calculate ORs
+m1_results <- m1 %>% 
+  emmeans(trt.vs.ctrl ~ paid|efficacy) %>%
+  {.$contrasts} %>%
+  confint(adjust = "none") %>%
+  data.frame %>%
+  rename(lci = "asymp.LCL",
+         uci = "asymp.UCL",
+         pe = "estimate") %>%
+  select(efficacy, pe, lci, uci) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ . %>% 
+           exp %>%
+           round(2) %>%
+           format(nsmall = 1))) %>%
+  mutate(odds_ratio = paste0(pe, " (", lci, " to ", uci, ")"),
+         imputation_method = imp_method,
+         int_p = car::Anova(m1) %>%
+           data.frame %>%
+           tibble::rownames_to_column() %>%
+           filter(rowname == "paid:efficacy") %>%
+           pull("Pr..Chisq.") %>%
+           p
+         )
+
+#Remove m1
+rm(m1)
+
+#Store results
+m1_results %>% data.table
+        }
+#Name the models
+names(mid_high_res) <- c("rbinom_mid",
+                         "uni",
+                         "zero")
+} else {
+  mid_high_res <- qread("Model Results (Mid-High Efficacy).RData")
+}
+Sys.time() - start
+stopCluster(cl)
+#Save
+qsave(mid_high_res, "Model Results (Mid-High Efficacy).RData")
+```
+
+#### 2019 Analyses
+
+```{r}
+
+if(!file.exists("Model 2019 Results.RData")) {
+#Store model results under different imputation methods
+m2019 <- foreach(d = list(cdata$uni, cdata$zero, cdata$rbinom),
+        imp_method = c("Uniform", "Zero", "Beta-Binomial"),
+        .packages = c("glmmTMB", "emmeans", "data.table",
+                      "dplyr", "stringr", "splines", "Hmisc")
+        ) %do% {
+          
+         d_2019 <- merge(d[year == 2019, 
+        .(npi, company, 
+          n_prescriptions, total_prescriptions)],
+      d[, .(amount = sum(amount),
+            other_amount = sum(other_amount),
+            n_payments = sum(amount > 0) %>%
+              factor(levels = c(0, 1, 2, 3, 4, 5, 6)),
+            n_other_payments = sum(other_amount > 0) %>%
+              factor(levels = c(0, 1, 2, 3, 4, 5, 6)),
+            latest_payment = fifelse(sum(amount > 0) > 0,
+                                     max(as.numeric(year)[
+                                       amount > 0]), 0),
+            latest_other_payment = fifelse(sum(other_amount > 0) > 0,
+                                           max(as.numeric(year)[
+                                             other_amount > 0]), 0)
+      ), 
+      by = .(npi, company)],
+      all.x = TRUE, all.y = FALSE,
+      by = c("npi", "company"))
+         
+         
+         #Specify columns to be changed
+         latest_cols <- c("latest_payment", "latest_other_payment")
+         
+         #Change these columns
+         d_2019[, (latest_cols) :=
+                  lapply(.SD, . %>% 
+                           factor),
+                .SDcols = latest_cols]
+
+           
+         #N of payments
+         m5 <- gam(data = d_2019,
+              family = binomial,
+              method = "REML",
+              cbind(n_prescriptions,
+                    total_prescriptions - n_prescriptions) ~
+                company +
+                n_payments +
+                s(other_amount, bs = "cs") +
+                n_other_payments +
+                latest_other_payment
+              )
+         
+         #Contrasts
+         m5_results <- m5 %>% 
+           emmeans(trt.vs.ctrl ~ n_payments,
+                   nuisance = c("company",
+                                "other_amount", 
+                                "n_other_amount", 
+                                "latest_other_amount")) %>%
+           {.$contrasts} %>%
+           confint(adjust = "none") %>%
+            data.frame %>%
+  rename(lci = lower.CL, #Flipped because will invert
+         uci =  upper.CL,
+         pe = estimate) %>%
+  mutate(contrast = word(contrast, 1) %>% 
+           str_remove("^n_payments") %>%
+           as.numeric) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ exp(.))) %>%
+  mutate(odds_ratio = paste0(pe  %>% round(2) %>% format(nsmall = 2),
+                             " (", lci  %>% round(2) %>% format(nsmall = 2),
+                             " to ",
+                             uci  %>% round(2) %>% format(nsmall = 2),
+                             ")"),
+         imputation_method = imp_method
+         ) %>%
+  select(contrast, pe, lci, uci, odds_ratio, imputation_method)
+
+         #Latest payment
+         m6 <- gam(data = d_2019,
+              family = binomial,
+              method = "REML",
+              cbind(n_prescriptions,
+                    total_prescriptions - n_prescriptions) ~
+                company +
+                latest_payment +
+                s(other_amount, bs = "cs") +
+                n_other_payments +
+                latest_other_payment
+              )
+         
+         
+         #Contrasts
+         m6_results <- m6 %>% 
+           emmeans(trt.vs.ctrl ~ latest_payment,
+                   nuisance = c("company",
+                                "other_amount", 
+                                "n_other_amount", 
+                                "latest_other_amount")) %>%
+           {.$contrasts} %>%
+           confint(adjust = "none") %>%
+            data.frame %>%
+  rename(lci = lower.CL, #Flipped because will invert
+         uci =  upper.CL,
+         pe = estimate) %>%
+  mutate(contrast = word(contrast, 1) %>% 
+           str_remove("latest_payment|0| - ") %>%
+           as.numeric) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ exp(.))) %>%
+  mutate(odds_ratio = paste0(pe  %>% round(2) %>% format(nsmall = 2),
+                             " (", lci  %>% round(2) %>% format(nsmall = 2),
+                             " to ",
+                             uci  %>% round(2) %>% format(nsmall = 2),
+                             ")"),
+         imputation_method = imp_method
+         ) %>%
+  select(contrast, pe, lci, uci, odds_ratio, imputation_method)
+         
+         
+         #Latest payment
+         m7 <- gam(data = d_2019,
+              family = binomial,
+              method = "REML",
+              cbind(n_prescriptions,
+                    total_prescriptions - n_prescriptions) ~
+                company +
+                latest_payment*n_payments +
+                s(other_amount, bs = "cs") +
+                n_other_payments +
+                latest_other_payment
+              )
+         
+         #Contrasts
+         m7_results <- m7 %>% 
+           emmeans(trt.vs.ctrl ~ n_payments & latest_payment,
+                   nuisance = c("company",
+                                "other_amount", 
+                                "n_other_amount", 
+                                "latest_other_amount")) %>%
+           {.$contrasts} %>%
+           confint(adjust = "none") %>%
+            data.frame %>%
+  rename(lci = lower.CL, #Flipped because will invert
+         uci =  upper.CL,
+         pe = estimate) %>%
+           filter(!contrast %>% str_detect("[1-5] latest_payment0")) %>%
+           filter(!contrast %>% str_detect("^n_payments0")) %>%
+  mutate(contrast = contrast %>% 
+           str_remove_all("n_payments|latest_payment|") %>%
+           word(1, 2)) %>%
+           #Remove impossible contrasts (e.g., > 2 payments if latest was 2015)
+           filter(contrast %nin% c("2 2015", "3 2015", "4 2015", "5 2015",
+                                   "3 2016", "4 2016", "5 2016",
+                                   "4 2017", "5 2017",
+                                   "5 2018")) %>%
+  mutate(across(.cols = .q(pe, lci, uci), ~ exp(.))) %>%
+  mutate(odds_ratio = paste0(pe  %>% round(2) %>% format(nsmall = 2),
+                             " (", lci  %>% round(2) %>% format(nsmall = 2),
+                             " to ",
+                             uci  %>% round(2) %>% format(nsmall = 2),
+                             ")"),
+         imputation_method = imp_method
+         ) %>%
+  select(contrast, pe, lci, uci, odds_ratio, imputation_method)
+         
+         
+         
+         #Combine in a list
+         list(m5 = m5_results %>% data.table,
+              m6 = m6_results %>% data.table,
+              m7 = m7_results %>% data.table)
+        }
+
+#Name list
+names(m2019) <- c("uni", "zero", "rbinom")
+
+} else {
+  m2019 <- qread("Model 2019 Results.RData")
+}
+
+#Save
+qsave(m2019, "Model 2019 Results.RData")
+```
+
+## Tabulate (Table 2 & S9/S10)
+
+```{r}
+
+#Insert table titles
+mtable_titles <- c(
+   "Table 2. Association between receipt of payments and prescription of a company's drugs (assuming a beta binomial distribution for censored counts).",
+  "eTable 9. Association between receipt of payments and prescription of a company's drugs (assuming a uniform distribution for censored counts).",
+  "eTable 10. Association between receipt of payments and prescription of a company's drugs (assuming no prescriptions for censored counts)."
+) 
+
+#Create lists to loop over
+mdfs <- list(
+  list(same_y = mres$rbinom[c("m1", "m2", "m3")], next_y = mres$rbinom_ny[c("m1", "m2", "m3")]),
+  list(same_y = mres$uniform[c("m1", "m2", "m3")], next_y = mres$uniform_ny[c("m1", "m2", "m3")]),
+  list(same_y = mres$zero[c("m1", "m2", "m3")], next_y = mres$zero_ny[c("m1", "m2", "m3")])
+)
+
+#Save table
+mtables <- foreach(mdf = mdfs,
+                   filename = c("Table 2", 
+                                "eTable 9",
+                                "eTable 10"),
+                   mtable_title = mtable_titles) %do% {
+  
+  
+          
+                     
+                     #Loop over contents of mdf to format appropriately 
+                     mtable <- foreach(part = mdf,
+                  or_name = c("Odds ratio (95% CI) for same-year prescriptions",
+                              "Odds ratio (95% CI) for next-year prescriptions")) %do% {
+          
+                                #Modify table before running flextable
+                                mtable <- part %>%
+                          rbindlist %>%
+                          select(paid_by, odds_ratio) %>%
+                          mutate(paid_by = paid_by %>%
+                                   str_replace_all(., c("paid" = "Payments received",
+                                                        "food_bev" = "Food & Beverages",
+                                                        "travel" = "Travel & Lodging",
+                                                        "educ" = "Education",
+                                                        "non_consult" = "Non-consulting services",
+                                                        "consult$" = "Consulting services",
+                                                        "other" = "Other",
+                                                        "Same company only" = "Manufacturer only",
+                                                        "Different company only" = "Competitor only",
+                                                        "Both companies" = "Manufacturer & competitor"))) %>%
+                          #First analysis header
+                          add_row(.before = 1,
+                                  paid_by = "Receipt of payments from company",
+                                  odds_ratio = "") %>%
+                          #First analysis unpaid group
+                          add_row(.after = which(.$paid_by == "Receipt of payments from company"),
+                                  paid_by = "No payments received",
+                                  odds_ratio = "Reference group") %>%
+                          #Second analysis header
+                          add_row(.after = which(.$paid_by == "Payments received"),
+                                  paid_by = "Source of payments",
+                                  odds_ratio = "") %>%
+                          #Second analysis unpaid group
+                          add_row(.after = which(.$paid_by == "Source of payments"),
+                              paid_by = "No payments received",
+                              odds_ratio = "Reference group") %>%
+                          #Third analysis header
+                          add_row(.before = which(.$paid_by == "Food & Beverages"),
+                              paid_by = "Type of payment",
+                              odds_ratio = "") %>%
+                              #Second analysis unpaid group
+                          add_row(.after = which(.$paid_by == "Type of payment"),
+                              paid_by = "No payments received",
+                              odds_ratio = "Reference group")
+  
+  #Create index for headers
+  headers_index <- mtable$odds_ratio == ""
+  
+  #Rename columns
+  mtable %>% setnames(old = c("paid_by", "odds_ratio"),
+             new = c("Type of analysis", or_name))
+          }
+
+          
+          
+   #Convert to flextable
+   mtable <- cbind(mtable[[1]],
+                mtable[[2]] %>% 
+                  select(-`Type of analysis`)) %>%
+     flextable
+   
+    #Create table borders
+    mtable <- border_outer(mtable)
+    
+    #Bold first column
+    mtable <- mtable <- bold(mtable, i = headers_index)
+    
+    #Apply some aesthetics to make the table more visually appropriate
+    mtable <- flextable_aes(mtable, table_title = mtable_title)
+    
+    #Align left first column
+    mtable <- align(mtable, j = 1, align = "left")
+    
+    #Add padding
+    mtable <- padding(mtable, j = 1, i = !headers_index,
+            padding.left = 20)
+    
+    #Adjust first column's width
+    mtable <- mtable %>% width(j = 1, width = 3)
+    
+    #Add borders
+    mtable <- hline(mtable, i = c(headers_index[-1], FALSE))
+  
+    #fontsize
+    mtable <- fontsize(mtable, size = 12, part = "all")
+    
+    #Save table as a word document
+    save_as_docx(mtable, path = paste0("Tables/", filename, " (", Sys.Date() , ").docx"))
+    
+    #Save in list
+    mtable
+        }
+
+#Display Table 3
+mtables[[3]]
+```
+
+## Figure 3A-D + S3-7A-D
+
+### 3A + S3-4A + S5-S7
+
+```{r}
+
+#Loop over different tables
+foreach(sfig_df = list(mres$rbinom$m4, mres$uniform$m4,
+                       mres$zero$m4, mres$rbinom_ny$m4,
+                       mres$uniform_ny$m4, mres$zero_ny$m4),
+        fig_name = c("3A", "e3A", "e4A", "e5", "e6", "e7") %>%
+          paste0("Figure ", .),
+        fig_title_end = 
+          c(" assumes a beta binomial distribution for censored counts.",
+            " assumes a uniform distribution for censored counts.",
+            " assumes no prescriptions for censored counts.") %>% rep(2),
+        fig_title_begin = 
+          c("This figure links payments and prescriptions in the same year" %>% rep(3),
+            "This figure links payments in a year to prescriptions in the next year" %>% rep(3))) %do% {
+                              
+#Plot
+ggplot(data = sfig_df %>%
+         mutate(across(.cols = c("lci", "uci", "pe"),
+                       ~ . %>% as.numeric)) %>%
+         add_row(.before = 1, pe = 1, lci = 1, uci = 1, contrast = 0),
+       aes(y = pe, 
+           ymin = lci,
+           ymax = uci,
+           x = contrast)) +
+  geom_line(linewidth = 1.5, 
+              color = "maroon") +
+  geom_ribbon(fill = "lightblue", alpha = 0.3) +
+  ggtitle("Association between amount of payment and likelihood of prescribing a given company's drug compared to other companies",
+          subtitle = paste0(fig_title_begin, ". It", fig_title_end, " The reference is no payments (0 on the X-axis).\nThe initial upward spike immediately after 0 represents the difference between receiving no payments and receiving a small payment.")) +
+  scale_x_continuous(name = "Amount of payment, $",
+                     expand = c(0, 0),
+                     limits = c(-100, 10100),
+                     breaks = seq(0, 10000, 500)) +
+  scale_y_continuous(name = "Odds ratio",
+                     expand = c(0, 0),
+                     trans = "log",
+                     limits = c(1, NA),
+                     breaks = seq(0, 5, 0.1)) +
+  scale_color_jama(name = "Type of payment") +
+  labs(tag = fig_name %>% word(2)) +
+  #Set theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0,
+                                     color = "grey45"),
+        axis.text.y = element_text(size = 18, face = "bold"),
+        axis.text.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        plot.tag.position = c(0.02, 0.99)
+  )
+
+ggsave(paste0("Figures/", fig_name, " (", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+                            }
+```
+
+### 3B + S3-4B
+
+```{r}
+#Loop over different tables
+foreach(sfig_df = list(m2019$rbinom$m5, m2019$uni$m5, m2019$zero$m5),
+        fig_name = c("3B", "e3B", "e4B") %>%
+          paste0("Figure ", .),
+        fig_title_end = 
+          c(" assumes a beta binomial distribution for censored counts.",
+            " assumes a uniform distribution for censored counts.",
+            " assumes no prescriptions for censored counts.")) %do% {
+                              
+#Plot
+ggplot(data = sfig_df %>%
+         mutate(across(.cols = c("lci", "uci", "pe"),
+                       ~ . %>% as.numeric)) %>%
+         add_row(.before = 1, pe = 1, lci = 1, uci = 1, contrast = 0),
+       aes(y = pe, 
+           ymin = lci,
+           ymax = uci,
+           x = contrast)) +
+  geom_pointrange(linewidth = 3, fatten = 12, color = "maroon") +
+                geom_line(linewidth = 1.25, color = "maroon") +
+  ggtitle("Association between number of years during which payments were received and likelihood of prescribing a given company's drug in 2019",
+          subtitle = paste0("The reference is no payments (0 on the X-axis).", " This figure assumes ", fig_title_end)) +
+  scale_x_continuous(name = "Number of years (2015-2019) during which a payment was received",
+                     limits = c(-0.1, 5.1),
+                     expand = c(0, 0),
+                     labels = c("No payments received",
+                                "One out of 5 years",
+                                "Two out of 5 years",
+                                "Three out of 5 years",
+                                "Four out of 5 years",
+                                "All 5 years  ")) +
+  scale_y_continuous(name = "Odds ratio",
+                     trans = "log",
+                     expand = c(0, 0.05)) +
+  scale_color_jama(name = "Type of payment") +
+  labs(tag = fig_name %>% word(2)) +
+  #Set theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 15),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        plot.tag.position = c(0.02, 0.99)
+  )
+
+ggsave(paste0("Figures/", fig_name, " (", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+                            }
+```
+
+### 3C + S3-4C
+
+```{r}
+#Loop over different tables
+foreach(sfig_df = list(m2019$rbinom$m6, m2019$uni$m6, m2019$zero$m6),
+        fig_name = c("3C", "e3C", "e4C") %>%
+          paste0("Figure ", .),
+        fig_title_end = 
+          c(" assumes a beta binomial distribution for censored counts.",
+            " assumes a uniform distribution for censored counts.",
+            " assumes no prescriptions for censored counts.")) %do% {
+                              
+#Plot
+ggplot(data = sfig_df %>%
+         mutate(across(.cols = c("lci", "uci", "pe"),
+                       ~ . %>% as.numeric),
+                contrast = contrast %>% as.character) %>%
+         add_row(.before = 1, pe = 1, lci = 1, uci = 1, contrast = "No payment received") %>%
+         mutate(contrast = fct_relevel(contrast, "No payment received")),
+       aes(y = pe, 
+           ymin = lci,
+           ymax = uci,
+           x = contrast,
+           group = 1)) +
+  geom_pointrange(linewidth = 3, fatten = 12, color = "maroon") +
+                geom_line(linewidth = 1.25, color = "maroon") +
+  ggtitle("Association between recency of payment and likelihood of prescribing a given company's drug in 2019",
+          subtitle = paste0("The reference is no payments (0 on the X-axis).", " This figure assumes ", fig_title_end)) +
+  scale_x_discrete(name = "Most recent year during which a payment was received",
+                     expand = c(0, 0.05)) +
+  scale_y_continuous(name = "Odds ratio",
+                     trans = "log",
+                     expand = c(0, 0.05)) +
+  scale_color_jama(name = "Type of payment") +
+  labs(tag = fig_name %>% word(2)) +
+  #Set theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 15),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        plot.tag.position = c(0.02, 0.99)
+  )
+
+ggsave(paste0("Figures/", fig_name, " (", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+                            }
+```
+
+### 3D + S3-4D
+
+```{r}
+#Loop over different tables
+foreach(sfig_df = list(m2019$rbinom$m7, m2019$uni$m7, m2019$zero$m7),
+        fig_name = c("3D", "e3D", "e4D") %>%
+          paste0("Figure ", .),
+        fig_title_end = 
+          c(" assumes a beta binomial distribution for censored counts.",
+            " assumes a uniform distribution for censored counts.",
+            " assumes no prescriptions for censored counts.")) %do% {
+                              
+#Plot
+ggplot(data = sfig_df %>%
+         mutate(across(.cols = c("lci", "uci", "pe"),
+                       ~ . %>% as.numeric),
+                contrast = contrast %>% as.character)  %>%
+         mutate(year = word(contrast, 2),
+                n = word(contrast, 1)) %>%
+         add_row(.before = 1, pe = 1, lci = 1, uci = 1, 
+                 year = "No payment received",
+                 n = "No payment received") %>%
+         mutate(year = year %>% fct_relevel("No payment received"),
+                n = n %>% fct_relevel("No payment received")),
+       aes(y = pe, 
+           ymin = lci,
+           ymax = uci,
+           x = year,
+           group = n,
+           color = n)) +
+  geom_pointrange(linewidth = 3, fatten = 12,
+                  position = position_dodge(0.5)) +
+  ggtitle("Joint association of recency and number of payments with the likelihood of prescribing a given company's drug in 2019",
+          subtitle = paste0("The reference is no payments (0 on the X-axis).", " This figure assumes ", fig_title_end)) +
+  scale_x_discrete(name = "Most recent year during which a payment was received",
+                     expand = c(0, 0.05)) +
+  scale_y_continuous(name = "Odds ratio",
+                     trans = "log",
+                     expand = c(0, 0.05)) +
+  scale_color_jama(name = "Number of years during which a payment was received",
+                   labels = c("No payments received",
+                              "One out of 5 years",
+                              "Two out of 5 years",
+                              "Three out of 5 years",
+                              "Four out of 5 years",
+                              "All 5 years")) +
+  labs(tag = fig_name %>% word(2)) +
+  #Set theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 15),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.position = c(0.2, 0.8),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 14, face = "bold"),
+        legend.key.width = unit(1, "cm"),
+        legend.key.height = unit(1, "cm"),
+        plot.tag.position = c(0.02, 0.99)
+  )
+
+ggsave(paste0("Figures/", fig_name, " (", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+                            }
+```
+
+## Fig 2B/S1B-S2B + STab 6-8
+
+### Create data
+
+```{r}
+#Perform analysis of receiving a payment (for each of the 3 imputation patterns)
+sdf <- foreach(d = list(cdata$rbinom, cdata$zero, cdata$uni)) %do% {
+#Create dataframe
+sdata <- d[, .(total_prescriptions = sum(n_prescriptions)/(length(2015:2019)),
+               amount = sum(amount),
+                     paid = max(paid),
+                   food_bev = max(food_bev),
+                   consult = max(consult),
+                   non_consult = max(non_consult),
+                   travel = max(travel),
+                   educ = max(educ),
+                   other = max(other)),
+                 by = .(npi)]
+
+#Set up a vector to label payments
+cat_labels = c("Any form", "Food & Beverages",  "Education",
+               "Other", "Travel & Lodging",
+               "Non-consulting services", "Consulting services")
+
+#Model $ value of payments as a function of annual prescriptions
+m8 <- gam(data = sdata %>%
+            filter(amount > 0),
+          family = Gamma(link = "log"),
+          method = "REML",
+          amount ~ s(total_prescriptions, bs = "cs"))
+
+#Store predictions
+amounts <- predict(m8,
+        newdata = data.frame(total_prescriptions = seq(0, quantile(sdata$total_prescriptions, 0.99))),
+        se.fit = TRUE
+          ) %>%
+  {data.table(
+    total_prescriptions = seq(0, quantile(sdata$total_prescriptions, 0.99)),
+    pe = .$fit %>% exp,
+    lci = (.$fit - (.$se.fit*qt(0.975, m8$df.residual))) %>% exp,
+    uci = (.$fit + (.$se.fit*qt(0.975, m8$df.residual))) %>% exp
+    
+  )}
+
+#Set up a for loop over different payment types
+sdata <- foreach(
+  payment_type = c("paid", payment_types_names),
+  cat_label = cat_labels) %do% {
+
+                    #Run model
+                    m7 <- gam(data = sdata,
+                                family = binomial,
+                                method = "REML",
+                                get(payment_type) ~
+                                s(total_prescriptions, bs = "cs"))
+
+                    #Create data.table
+                    ors <- m7 %>%
+                      avg_comparisons(variables = list(total_prescriptions = "iqr"),
+                                      comparison = "lnor", transform = exp) %>%
+                      data.table(payment_type = cat_label,
+                       pe = .$estimate %>% r2,
+                       lci = .$conf.low %>% r2,
+                       uci = .$conf.high %>% r2,
+                       high_prop = m7 %>% 
+                         predict(data.frame(
+                           total_prescriptions = sdata$total_prescriptions %>%
+                                              quantile(0.75)), 
+                                 type = "response") %>%
+                         {.*100} %>% r1 %>% as.numeric,
+                       low_prop = m7 %>% 
+                         predict(data.frame(
+                           total_prescriptions = sdata$total_prescriptions %>%
+                                              quantile(0.25)), 
+                                 type = "response") %>%
+                         {.*100} %>% r1 %>% as.numeric) %>%
+                      mutate(
+                        pe_ci = paste0(pe, " (", lci, " to ", uci, ")")) %>%
+                                select(payment_type, low_prop, high_prop, 
+                                       pe, lci, uci, pe_ci)
+                    
+                    
+                    #Probability of receiving a payment according to prescription volume
+                    probs <- predict(m7, 
+                                     type = "link",
+                                     se.fit = TRUE,
+                                     newdata = 
+                                       data.frame(total_prescriptions = 
+                                                    seq(0, quantile(sdata$total_prescriptions, c(0.99)))))
+                    probs <- data.table(
+                      prob = exp(probs$fit)/(1 + exp(probs$fit)),
+                      lci = exp(probs$fit - qnorm(0.975)*probs$se.fit)/
+                        (1 + exp(probs$fit - qnorm(0.975)*probs$se.fit)),
+                      uci = exp(probs$fit + qnorm(0.975)*probs$se.fit)/
+                        (1 + exp(probs$fit + qnorm(0.975)*probs$se.fit)),
+                      total_prescriptions = seq(0,quantile(sdata$total_prescriptions, c(0.99))),
+                      type = cat_label
+                    )
+                    
+                    #Combine in a list
+                    list(ors, probs)
+                  }
+
+#Name elements of list
+names(sdata) <- c("any", payment_types_names)
+
+#Name sub-elements
+for(i in 1:7) {
+  names(sdata[[i]]) <- c("ors", "probs")
+}
+
+##Rearrange internals of stable_data
+#Put ORs together
+sdata$ors <- foreach(index = c("any", payment_types_names),
+                           .combine = "rbind") %do% {
+  sdata[[index]]$ors
+                           }
+#Put probs together
+sdata$probs <- foreach(index = c("any", payment_types_names),
+                           .combine = "rbind") %do% {
+  data.table(prob = sdata[[index]]$probs$prob,
+             lci = sdata[[index]]$probs$lci,
+             uci = sdata[[index]]$probs$uci,
+             total_prescriptions = sdata[[index]]$probs$total_prescriptions,
+             type =  sdata[[index]]$probs$type)
+}
+
+#Mutate ORs component
+sdata$ors <- sdata$ors %>% 
+  mutate(payment_type = factor(payment_type, c("Any form",
+                                               "Food & Beverages",
+                                               "Travel & Lodging",
+                                               "Education",
+                                               "Consulting services",
+                                               "Non-consulting services",
+                                               "Other"))) %>%
+  arrange(payment_type)
+
+
+
+#Return stable_data with the desired subelements
+c(sdata[c("ors", "probs")], list(amounts = amounts))
+}
+names(sdf) <- c("rbinom", "zero", "uni")
+```
+
+### Create tables
+
+```{r}
+#Loop over different tables
+foreach(stable_df = list(sdf$rbinom$ors, sdf$uni$ors, sdf$zero$ors),
+        table_no = c("6", "7", "8"),
+        table_title_end = c(" (assuming a beta binomial distribution for censored counts).",
+                            " (assuming a uniform distribution for censored counts).",
+                            " (assuming no prescriptions for censored counts).")) %do% {
+#Select and rename relevant columns
+stable <- stable_df %>%
+  select(payment_type, low_prop, high_prop, pe_ci) %>%
+  rename("Type of payment" = payment_type,
+         "Proportion receiving payment at the 25th percentile of prescriptions (%)" = low_prop,
+         "Proportion receiving payment at the 75th percentile of prescriptions (%)" = high_prop,
+         "Odds Ratio (95% CI)" = pe_ci) %>%
+  flextable
+
+
+#Create table borders
+stable <- border_inner(stable)
+stable <- border_outer(stable)
+
+#Bold first column
+stable <- bold(stable, j = c(1))
+
+#Apply some aesthetics to make the table more visually appropriate
+stable <- flextable_aes(stable, table_title = paste0("eTable ", table_no, ". Association of prescription volume with having received a given type of payment", table_title_end))
+
+
+#fontsize
+    stable <- fontsize(stable, size = 12, part = "all")
+
+#Save table as a word document
+save_as_docx(stable, path = paste0("Tables/eTable ", table_no, " (", Sys.Date() , ").docx"))
+}
+```
+
+### Create figures
+
+#### Probabilities
+
+```{r}
+foreach(sfig_df = list(sdf$rbinom$probs, 
+                       sdf$uni$probs, 
+                       sdf$zero$probs),
+        fig_name = c("Figure 2B",
+                     "Figure e1B",
+                     "Figure e2B"),
+        fig_title_end = c("assumes a beta binomial distribution for censored counts.",
+                            "assumes a uniform distribution for censored counts.",
+                            "assumes no prescriptions for censored counts.")) %do% {
+                                  
+sfig_df[, type := factor(type,
+                      levels = sfig_df[, .(prob = mean(prob)), by = type] %>%
+                        arrange(-prob) %>%
+                        pull(type))]
+                              
+#Plot
+ggplot(data = sfig_df %>% 
+         filter(total_prescriptions >= 10),
+       aes(y = prob*100, 
+           x = total_prescriptions,
+           ymin = lci*100,
+           ymax = uci*100,
+           color = type,
+           fill = type)) +
+  geom_ribbon(alpha = 0.05, color = "transparent") +
+  geom_line(linewidth = 1.5) +
+  ggtitle("Probability of receiving industry payment according to prescription volume & type of payment, 2015-2019",
+          subtitle = paste0("Different colors correspond to different types of payments. This figure ", fig_title_end)) +
+  scale_x_continuous(name = "Average annual prescriptions (2015-2019), N",
+                     expand = c(0, 0),
+                     breaks = seq(0, 1000, 50)) +
+  scale_y_continuous(name = "Probability of receiving a payment, %",
+                     expand = c(0, 0),
+                     limits = c(0, 102),
+                     breaks = seq(0, 100, 10)) +
+  scale_color_jama(name = "Type of payment") +
+  scale_fill_jama(name = "Type of payment") +
+  labs(tag = fig_name %>% word(2)) +
+  #Set theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.position = c(0.85, 0.4),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 13, face = "bold"),
+        legend.key.width = unit(1.5, "cm"),
+        legend.key.height = unit(0.75, "cm"),
+        plot.tag.position = c(0.02, 0.99)
+  )
+
+ggsave(paste0("Figures/", fig_name, " (", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+                              
+                            }
+```
+
+#### Amounts
+
+```{r}
+foreach(sfig_df = list(sdf$rbinom$amounts, 
+                       sdf$uni$amounts, 
+                       sdf$zero$amounts),
+        fig_name = c("Figure 2C",
+                     "Figure e1C",
+                     "Figure e2C"),
+        fig_title_end = c("assumes a beta binomial distribution for censored counts.",
+                            "assumes a uniform distribution for censored counts.",
+                            "assumes no prescriptions for censored counts.")) %do% {
+
+#Plot
+ggplot(data = sfig_df %>% 
+         filter(total_prescriptions >= 10),
+       aes(y = pe,
+           ymin = lci,
+           ymax = uci,
+           x = total_prescriptions)) +
+  geom_ribbon(alpha = 0.15, fill = "lightblue") +
+  geom_line(linewidth = 1.5, color = "maroon") +
+  ggtitle("Value of industry payments received according to prescription volume, 2015-2019",
+          subtitle = paste0("This figure shows whether the value of payments was correlated with prescription volumes among physicians who received industry payments. It ", fig_title_end)) +
+  scale_x_continuous(name = "Average annual prescriptions (2015-2019), N",
+                     expand = c(0, 0),
+                     breaks = seq(0, 1000, 50)) +
+  scale_y_continuous(name = "Value of payments, $",
+                     expand = c(0, 0),
+                     breaks = c(10, 100, 1000, 10000, 
+                                100000, 1000000),
+                     trans = "log",
+                     labels = label_comma()) +
+  labs(tag = fig_name %>% word(2)) +
+  #Set theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.position = c(0.85, 0.4),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 11, face = "bold"),
+        legend.key.width = unit(1.5, "cm"),
+        legend.key.height = unit(0.75, "cm"),
+        plot.tag.position = c(0.02, 0.99)
+  )
+
+ggsave(paste0("Figures/", fig_name, " (", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+                              
+                            }
+```
+
+## Figure 2A/S1A-S2A
+
+### Set up data
+
+```{r}
+
+prescription_dist <- foreach(d = list(cdata$rbinom, cdata$uni, cdata$zero)) %do% {
+#Create data.table for Figure 2
+cats = c(payment_types_names, "paid")
+cat_labels = c(cat_labels[cat_labels != "Any form"], "No payments")
+
+fig_df <- foreach(cat = cats,
+        cat_label = cat_labels,
+        .combine = "rbind") %do% {
+          
+          if(cat != "paid") {
+            fig_data <- copy(d[, 
+                               .(total_prescriptions =
+                                   sum(n_prescriptions)/length(2015:2019),
+                                     amount = sum(amount),
+                                     cat_var = any(get(cat) == 1)),
+                                   by = npi][
+                                     cat_var == TRUE][,
+                                                      cat := cat_label %>%
+                                                        factor][,
+                                                              .(total_prescriptions, cat)])
+          } else {
+            fig_data <- copy(d[,
+                               .(total_prescriptions = 
+                                   sum(n_prescriptions)/length(2015:2019),
+                                     amount = sum(amount)),
+                                   by = npi][
+                                     amount == 0][,
+                                                  cat := cat_label %>%
+                                                    factor][,
+                                                            .(total_prescriptions, cat)])
+            
+          }
+          fig_data
+
+        }
+
+#Arrange factor levels
+fig_df[, cat := fct_relevel(cat, c("No payments", 
+                                "Food & Beverages",
+                                "Travel & Lodging",
+                                "Consulting services",
+                                "Non-consulting services",
+                                "Education",
+                                "Other"))]
+}
+names(prescription_dist) <- c("rbinom", "uni", "zero")
+```
+
+### Create Figures
+
+```{r, fig.width = 16, fig.height = 9, dpi = 600}
+
+foreach(fig_df = prescription_dist,
+        fig_no = c("2A", "e1A", "e2A"),
+        fig_title_end = c("assumes a beta binomial distribution for censored counts.",
+                            "assumes a uniform distribution for censored counts.",
+                            "assumes no prescriptions for censored counts.")) %do% {
+#Plot
+ggplot(data = fig_df,
+       aes(y = total_prescriptions, 
+           x = cat,
+           color = cat,
+           fill = cat)) +
+  stat_halfeye(    # adjust bandwidth
+    adjust = 0.5,
+    justification = -0.03,
+    .width = 0.5,
+    color = "black",
+    fatten_point = 4,
+    linewidth = 8) +
+  ggtitle("Total number of prescriptions according to type of payment, 2015-2019",
+          subtitle = paste0("Points and intervals represent medians and interquartile ranges respectively. Shaded regions represent the distribution of total prescriptions. This figure ", fig_title_end, "\nNon-consulting services includes activities such as speaking or serving as faculty. The `Other` category includes grants, gifts, charitable contributions, honararia, royalty and licensing fees, and entertainment fees.")) +
+  scale_y_continuous(name = "Average annual prescriptions (2015-2019), N",
+                     trans = "log",
+                     breaks = c(10, 25, 50, 100, 250, 500, 1000, 2500, 5000)) +
+  scale_x_discrete(name = NULL) +
+  scale_fill_jama() +
+  scale_color_jama() +
+  labs(tag = fig_no) +
+  #Set theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold", hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.text.x = element_text(size = 13, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.position = "none",
+        legend.text = element_text(size = 11, face = "bold"),
+        legend.key.width = unit(1.5, "cm"),
+        legend.key.height = unit(0.75, "cm"),
+        plot.tag.position = c(0.02, 0.99)
+  ) +
+  coord_cartesian(xlim = c(1.4, 7.2))
+
+ggsave(paste0("Figures/Figure ", fig_no, " (", Sys.Date(), ").png"),
+       dpi = 600,
+       width = 16, height = 9)
+
+
+}
+
+```
+
+### Perform Wilcoxon
+
+```{r}
+wilcoxon_ps <- foreach(df = prescription_dist) %do% {
+  
+cat_n_prescriptions_ps <- foreach(cat_label = cat_labels[cat_labels != "No payments"],
+                                  .combine = "rbind") %do% {
+
+    data.table(
+      cat = cat_label,
+      p = wilcox.test(df[cat == "No payments", total_prescriptions],
+            df[cat == cat_label, total_prescriptions])$p.value %>%
+    p
+    )
+  
+                                  }
+}
+names(wilcoxon_ps) <- c("rbinom", "uni", "zero")
+```
+
+# Create data needed to render the Results
+
+```{r}
+save(total_prescribers_2015_2019,
+           paid_prescribers_2015_2019,
+           paid_prop_2015_2019,
+           total_payments_2015_2019,
+           total_amount_2015_2019,
+           qs_2015_2019,
+           amount_top_earners_2015_2019,
+           highest_payments_company,
+           highest_payments_company_amount,
+           highest_reach_company,
+           highest_reach_n,
+           n_comps,
+           mres,
+           m2019,
+           prescription_dist,
+           wilcoxon_ps,
+     max_drug,
+     max2_drug,
+     max_prop,
+     max2_prop,
+     plist,
+     mid_high_res,
+     file = "Rendering Data.RData")
+```

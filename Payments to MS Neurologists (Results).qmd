@@ -1,0 +1,67 @@
+---
+title: "Industry Payments to Neurologists Prescribing Multiple Sclerosis Drugs"
+subtitle: "A Combined Analysis of the Open Payments and Medicare Part D Prescribers Databases"
+format: 
+  html:
+    toc: true
+    toc-expand: true
+    toc-location: body
+date: 2-5-2024
+theme: lightly
+author:
+  - name: "Ahmed Sayed (asu.ahmed.sayed@gmail.com) & Joseph S. Ross (joseph.ross@yale.edu)"
+    affiliations: "Ain Shams University, Faculty of Medicine & Yale School of Medicine"
+embed-resources: true
+toc-title: Contents
+page-layout: full
+code-fold: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load data/functions needed to render this document
+
+```{r, message=FALSE, warning = FALSE}
+#Load the data
+load("Rendering Data.RData")
+
+#Load the libraries
+library(dplyr)
+library(data.table)
+library(stringr)
+#Function to add commas
+comma <- function(x) {
+  if(!is.numeric(x)) {
+    x <- x %>% pull
+  }
+  x %>%
+    format(big.mark = ",", trim = T)
+}
+```
+
+# Results Section
+
+**Characteristics of Payments made to Neurologists Prescribing Multiple Sclerosis Drugs**
+
+From 2015 to 2019, a total of `r total_prescribers_2015_2019 %>% comma` neurologists who prescribed an MS drug 11 or more times in a given year were identified. Of these, `r paid_prescribers_2015_2019 %>% comma` (`r paid_prop_2015_2019`%) received payments from industry (**Table 1**). In total, these prescribers received `r total_payments_2015_2019 %>% comma` distinct payments amounting to \$`r round(total_amount_2015_2019/1000000, 1)` million in value (**Figure 1)**. The distribution of payments among recipients was skewed. The median recipient received \$`r round(qs_2015_2019[2], 0)`, with an IQR of \$`r round(qs_2015_2019[1], 0)` to \$`r round(qs_2015_2019[3], 0)`. In contrast, those in the top percentile earned a total of \$`r round(amount_top_earners_2015_2019/1000000, 1)` million, comprising `r round(100*(amount_top_earners_2015_2019/total_amount_2015_2019), 1)`% of the total value of payments. Overall, `r highest_payments_company` made the highest total value of payments (\$`r round(highest_payments_company_amount/1000000 , 1)` million) whereas `r highest_reach_company` had the greatest market penetration, reaching `r highest_reach_n  %>% comma` prescribers (`r round(100*(highest_reach_n/ total_prescribers_2015_2019), 1)`% of total prescribers). The characteristics of payments overall and by company are summarized in **Table 1**. Further, most providers (`r n_comps[companies_cats == "2 companies or more", Total %>% word(2) %>% str_remove_all("\\(|\\)")]`%) received payments from 2 or more companies over the study period, with only `r n_comps[companies_cats == "1 company only", Total %>% word(2) %>% str_remove_all("\\(|\\)")]`% receiving payments from a single company only. In terms of prescriptions, `r max_drug` (`r max_prop`%) and `r max2_drug` (`r max2_prop`%) were the most commonly prescribed drugs. Physicians made a median of `r plist$rbinom$iqr_n["50%"]` prescriptions (IQR `r plist$rbinom$iqr_n["25%"]` to `r plist$rbinom$iqr_n["75%"]`) from 2015-2019; physicians in the highest decile made `r plist$rbinom$top10_n %>% comma` prescriptions, comprising `r (100*plist$rbinom$top10_n/plist$rbinom$total_n) %>% format(digits = 2)`% of the total number of prescriptions.
+
+**Association of payments with the proportion of prescriptions from a company's portfolio**
+
+*Yearly Payments & Prescriptions*
+
+**Table 2** summarizes the association between the receipt of payments from a company and prescribing that company's drugs. Overall, those who received a payment from a given company were more likely to prescribe its drugs (OR: `r mres$rbinom$m1[,paste0(pe, "; 95% CI: ", lci, " to ", uci)]`) compared to those who received no payments from said company. This was more pronounced for moderate-efficacy drugs (OR: `r mid_high_res$rbinom_mid$odds_ratio`) than for high-efficacy drugs (OR: `r mid_high_res$rbinom_high$odds_ratio`). Compared to those who received no payments from any company, those who received payments from one company only were more likely to prescribe that drug (OR: `r mres$rbinom$m2[paid_by == "Same company only", paste0(pe, "; 95% CI: ", lci, " to ", uci)]`), an association which was attenuated when a provider had also received payments from a competitor (OR: `r mres$rbinom$m2[paid_by == "Both companies", paste0(pe, "; 95% CI: ", lci, " to ", uci)]`). In contrast, those who received no payments from a particular company but did receive payments from a competitor were less likely to prescribe that company's drugs (OR: `r mres$rbinom$m2[paid_by == "Different company only", paste0(pe, "; 95% CI: ", lci, " to ", uci)]`).
+
+All types of payments were associated with an increased likelihood of prescribing a company's drugs compared to no payments; however, the associations varied in magnitude. The highest association was found for payments made for non-consulting services, which included activities such as being a speaker at a venue or serving as faculty at an event (OR: `r mres$rbinom$m3[paid_by == "non_consult", paste0(pe, "; 95% CI: ", lci, " to ", uci)]`) (**Table 3**). **Figure 2A** shows the association between increasing amounts of payments and prescriptions. Associations were evident even at low payment amounts (OR for \$50 versus \$0: `r mres$rbinom$m4[contrast == 50, pe %>% format(digits = 3)]`; 95% CI: `r mres$rbinom$m4[contrast == 50, lci %>% format(digits = 3)]` to `r mres$rbinom$m4[contrast == 50, uci %>% format(digits = 3)]`) and became more evident with increasing amounts, with ORs of `r mres$rbinom$m4[contrast == 500, pe %>% format(digits = 3)]`, `r mres$rbinom$m4[contrast == 1000, pe %>% format(digits = 3)]`, and `r mres$rbinom$m4[contrast == 5000, pe %>% format(digits = 3)]` at \$500, \$1000, and \$5000 (all compared to \$0) respectively.
+
+An additional analyses linking payments received in the year preceding prescriptions (rather than payments received during the same year) showed similar findings (**Table 2**). These associations were robust when different imputation methods were used **(Supplement)**, although there was a change in the magnitude of the association, being smaller when a uniform distribution was used and larger when zeros were used.
+
+*Frequency & Recency of Payments*
+
+**Figures 2B-D** show the association between frequency & recency of payments with prescriptions. Compared to a physician receiving no payments, those receiving payments for 1, 2, 3, 4, or 5 of 5 years from 2015-2019 were more likely to prescribe that company's drugs, with progressively greater associations (ORs of `r m2019$rbinom$m5[contrast == 1, pe] %>% format(digits = 3)`, `r m2019$rbinom$m5[contrast == 2, pe] %>% format(digits = 3)`, `r m2019$rbinom$m5[contrast == 3, pe] %>% format(digits = 3)`, `r m2019$rbinom$m5[contrast == 4, pe] %>% format(digits = 3)`, `r m2019$rbinom$m5[contrast == 5, pe] %>% format(digits = 3)`) respectively; all confidence intervals were narrow and excluded the null as shown in **Figure 2B**). Likewise, physicians were more likely to prescribe a given company's drug in 2019 the more temporally proximal its payment was. Compared to a physician receiving no payments, those receiving payments in 2015, 2016, 2017, 2018, and 2019 were progressively more likely to prescribe a given company's drugs (ORs of `r m2019$rbinom$m6[contrast == 2015, pe %>% format(digits = 3)]`, `r m2019$rbinom$m6[contrast == 2015, pe %>% format(digits = 3)]`, `r m2019$rbinom$m6[contrast == 2016, pe %>% format(digits = 3)]`, `r m2019$rbinom$m6[contrast == 2017, pe %>% format(digits = 3)]`, `r m2019$rbinom$m6[contrast == 2018, pe %>% format(digits = 3)]`, `r m2019$rbinom$m6[contrast == 2019, pe %>% format(digits = 3)]` respectively; all confidence intervals exceeded the null as shown in **Figure 2C**). When both factors were jointly assessed, the frequency of payments was more strongly related to prescriptions. Compared to a physician receiving no payments, the greatest ORs were found for physicians who received payments every year from 2015-2019 (OR of `r m2019$rbinom$m7[contrast == "5 2019", pe %>% format(digits = 3)]`) or those who received payments every year from 2015-2018 (OR of `r m2019$rbinom$m7[contrast == "4 2018", pe %>% format(digits = 3)]`; **Figure 2D**).
+
+**Association of payments with the volume of a provider's prescriptions**
+
+**Figure 3A** shows the volume of a provider's average annual prescriptions from 2015-2019 according to whether a provider received no payments at all (median: `r prescription_dist$rbinom[cat == "No payments", median(total_prescriptions)%>% round(0)]`; IQR: `r prescription_dist$rbinom[cat == "No payments", quantile(total_prescriptions) %>% round(0)][c(2, 4)] %>% {paste0(.[1], " to ", .[2])}`), received payments for foods and beverages (median: `r prescription_dist$rbinom[cat == "Food & Beverages", median(total_prescriptions) %>% round(0)]`; IQR: `r prescription_dist$rbinom[cat == "Food & Beverages", quantile(total_prescriptions) %>% round(0)][c(2, 4)] %>% {paste0(.[1], " to ", .[2])}`), received payments for travel and lodging (median: `r prescription_dist$rbinom[cat == "Travel & Lodging", median(total_prescriptions) %>% round(0)]`; IQR: `r prescription_dist$rbinom[cat == "Travel & Lodging", quantile(total_prescriptions) %>% round(0)][c(2, 4)] %>% {paste0(.[1], " to ", .[2])}`), received payments for consulting services (median: `r prescription_dist$rbinom[cat == "Consulting services", median(total_prescriptions) %>% round(0)]`; IQR: `r prescription_dist$rbinom[cat == "Consulting services", quantile(total_prescriptions) %>% round(0)][c(2, 4)] %>% {paste0(.[1], " to ", .[2])}`), received payments for non-consulting services (median: `r prescription_dist$rbinom[cat == "Non-consulting services", median(total_prescriptions) %>% round(0)]`; IQR: `r prescription_dist$rbinom[cat == "Non-consulting services", quantile(total_prescriptions) %>% round(0)][c(2, 4)] %>% {paste0(.[1], " to ", .[2])}`), received payments for educational activities (median: `r prescription_dist$rbinom[cat == "Education", median(total_prescriptions) %>% round(0)]`; IQR: `r prescription_dist$rbinom[cat == "Education", quantile(total_prescriptions) %>% round(0)][c(2, 4)] %>% {paste0(.[1], " to ", .[2])}`), or other types of payments (median: `r prescription_dist$rbinom[cat == "Other", median(total_prescriptions) %>% round(0)]`; IQR: `r prescription_dist$rbinom[cat == "Other", quantile(total_prescriptions) %>% round(0)][c(2, 4)] %>% {paste0(.[1], " to ", .[2])}`). All 6 types of payments went to providers who had a higher total volume of prescriptions compared to providers who received no payments (*P* `r wilcoxon_ps[[1]]$p %>% unique` for all). The same patterns were evident when under alternative imputation methods (**Supplement)**.
+
+**Figure 3B** shows the probability of a physician receiving an industry payment across increasing values of averaged annual prescriptions from 2015-2019. Positive associations were found for all types of payments, but the slopes were steepest for payments related to consulting services, non-consulting services, and travel & lodging.
