@@ -2,4 +2,6 @@ These quarto files contain the necessary code required to replicate an analysis 
 
 The necessary files can be downloaded from Open Payments platform (https://openpaymentsdata.cms.gov/datasets) and the Medicare Part D Database stratified by provider and drug (https://data.cms.gov/provider-summary-by-type-of-service/medicare-part-d-prescribers/medicare-part-d-prescribers-by-provider-and-drug).
 
+Also, please note that this code reflects the analysis at the *time of submission*, and may not incorporate all of the additions and subtractions present in the final (accepted) work.
+
 If you have any questions related to the statistical code, please contact me at asu.ahmed.sayed@gmail.com
